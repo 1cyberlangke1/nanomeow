@@ -38,6 +38,10 @@ hs_err_pid*
 # 临时 clone / 临时目录
 tmp/
 
+# 数据集 / 语料（体积大，不入库；用 train/notebooks/prepare_dataset.ipynb 重新生成）
+# 原始下载文件、清洗产物、meta 与 HF 下载缓存都在里面
+train/dataset/
+
 # Python 虚拟环境 / 缓存
 .venv/
 __pycache__/
@@ -45,6 +49,9 @@ __pycache__/
 *.egg-info/
 .cache/
 .coverage
+
+# Jupyter
+.ipynb_checkpoints/
 
 # 编译产物
 build/
