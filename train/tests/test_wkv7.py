@@ -3,9 +3,11 @@
 逐 token 递推是定义本身，分块只是同一串运算的重排，两者必须在数值上一致。
 """
 
+import pytest
 import torch
 
 from src.wkv7 import run_wkv7, wkv7_chunked
+from src.wkv7_cuda import wkv7_cuda
 
 
 def naive_wkv7(w, q, k, v, a, b):
@@ -153,3 +155,52 @@ def test_weak_decay_dense_ab_matches_naive():
     y, _ = wkv7_chunked(w, q, k, v, a, b, chunk=64)
     assert torch.isfinite(y).all()
     assert _rel_err(y, naive_wkv7(w, q, k, v, a, b)) < 1e-4
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
+def test_cuda_matches_chunked():
+    """CUDA 快路径（head_size=8/chunk=16）与分块实现一致：前向与六个梯度都要对上。
+
+    容差 2e-2 是 bf16 的量级（kernel 内部 token 向量走 bf16，2^-8 ≈ 3.9e-3），
+    实测 T=512 时最大相对误差 5.4e-3。
+    """
+    w, q, k, v, a, b = _rand(2, 128, 4, 8, seed=3)
+    cpu = [t.clone().requires_grad_(True) for t in (w, q, k, v, a, b)]
+    y_cpu, _ = wkv7_chunked(*cpu, chunk=64)
+    y_cpu.sum().backward()
+    gpu = [t.clone().cuda().requires_grad_(True) for t in (w, q, k, v, a, b)]
+    y_gpu, _ = wkv7_chunked(*gpu, chunk=16)
+    y_gpu.sum().backward()
+    assert _rel_err(y_gpu.cpu(), y_cpu) < 2e-2
+    for tc, tu in zip(cpu, gpu):
+        assert _rel_err(tu.grad.cpu(), tc.grad) < 2e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
+def test_cuda_state_step_rounds_state():
+    """state_step > 0 时 state 落在网格上，且前向与「边界取整」的逐 token 递推一致。
+
+    这是 QAT 里 int32 state 的定点边界：每过一个 chunk，state 就按 state_step 取整。
+    取整本身没有梯度（kernel 反向按 STE 直通），所以只对前向取整这件事做断言。
+    """
+    bsz, t_len, n_head, dim, chunk, step = 2, 128, 4, 8, 16, 0.01
+    w, q, k, v, a, b = _rand(bsz, t_len, n_head, dim, seed=5)
+    w64, q64, k64, v64, a64, b64 = (t.double() for t in (w, q, k, v, a, b))
+    state = torch.zeros(bsz, n_head, dim, dim, dtype=torch.float64)
+    ys = []
+    for t in range(t_len):
+        decay = torch.exp(-torch.exp(w64[:, t]))
+        sa = torch.einsum("bhc,bhcd->bhd", a64[:, t], state)
+        state = (decay.unsqueeze(-1) * state
+                 + b64[:, t].unsqueeze(-1) * sa.unsqueeze(-2)
+                 + k64[:, t].unsqueeze(-1) * v64[:, t].unsqueeze(-2))
+        ys.append(torch.einsum("bhc,bhcd->bhd", q64[:, t], state))
+        if (t + 1) % chunk == 0:
+            state = torch.round(state / step) * step
+    y_want = torch.stack(ys, dim=1)
+
+    g = [t.cuda().requires_grad_(True) for t in (w, q, k, v, a, b)]
+    y_got, state_got = wkv7_cuda(-torch.exp(g[0].float()), *(t.to(torch.bfloat16) for t in g[1:]),
+                                 chunk_len=chunk, state_step=step, return_state=True)
+    assert _rel_err(y_got.cpu(), y_want) < 3e-2
+    grid = (state_got.cpu().double() / step)
+    assert (grid - grid.round()).abs().max() < 1e-3
