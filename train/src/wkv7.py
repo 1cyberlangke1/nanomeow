@@ -62,7 +62,7 @@ from .qat import _Round
 
 CHUNK = 16
 
-# PLAN §9.1：decay 的 exp 走 256 项 × 2 字节的定点 LUT，输出是 16 位定点（Q15），
+# decay 的 exp 走 256 项 × 2 字节的定点 LUT，输出是 16 位定点（Q15），
 # 所以 QAT 里按 2^-15 的网格量化 w = exp(log_w)。
 WKV_LUT_FRAC_BITS = 15
 
@@ -116,13 +116,38 @@ def _wkv7_chunked_fp32(w, q, k, v, a, b, state_in, chunk, qat=None):
 
     qat_on = qat is not None and qat.enabled
     if qat_on:
-        # PLAN §7.4：递推本体的输入侧插桩。q/k/v/a/b 是激活，先量化到 int8；decay 的
+        # 递推本体的输入侧插桩。q/k/v/a/b 是激活，先量化到 int8；decay 的
         # exp 走定点 LUT，按 Q15 输出网格量化。w = exp(log_w) 恒在 [0.545, 1) 内
         # （w_in <= -0.5），所以这里的 clamp 永远不会触底，只是防 log(0)。
-        q, k, v, a, b = (qat(t) for t in (q, k, v, a, b))
+        q = qat(q)
+        k = qat(k)
+        k_scale = qat.scale
+        v = qat(v)
+        v_scale = qat.scale
+        a, b = qat(a), qat(b)
         w_lut = torch.exp(log_w)
         w_lut = _Round.apply(w_lut * (2.0 ** WKV_LUT_FRAC_BITS)) * (2.0 ** -WKV_LUT_FRAC_BITS)
         log_w = torch.log(torch.clamp(w_lut, min=2.0 ** -WKV_LUT_FRAC_BITS))
+        # state 存 int32：量化步长就是 k·vᵀ 累加器的最小单位 scale_k × scale_v，
+        # 直接取量化器这一趟用的 scale，不在本地按范围重算。
+        state_step = (k_scale * v_scale).clamp_min(1e-12)
+    else:
+        state_step = None
+
+    # CUDA 快路径。分块实现把 [B,H,n,chunk,chunk] 的中间量物化到显存，一步读写几十 GB，
+    # 显存带宽成瓶颈（实测 batch 768 反而比 256 慢）；参考 kernel 每个线程持 state 的一列、
+    # token 向量走 shared，一步只读写一遍。kernel 只编了 head_size=8 / chunk=16，
+    # 其余维度与 CPU 走下面的分块实现。
+    if state_in is None and log_w.is_cuda and dim == 8 and chunk == 16:
+        from .wkv7_cuda import wkv7_cuda
+        y, state_out = wkv7_cuda(log_w, q.to(torch.bfloat16), k.to(torch.bfloat16),
+                                 v.to(torch.bfloat16), a.to(torch.bfloat16),
+                                 b.to(torch.bfloat16), chunk,
+                                 state_step if state_step is not None else 0.0,
+                                 return_state=True)
+        if pad:
+            y = y[:, :t_len]
+        return y.to(out_dtype), state_out
 
     n_chunk = t_pad // chunk
     log_w, q, k, v, a, b = (to_chunks(t, n_chunk, chunk) for t in (log_w, q, k, v, a, b))
@@ -160,10 +185,6 @@ def _wkv7_chunked_fp32(w, q, k, v, a, b, state_in, chunk, qat=None):
         state = torch.zeros(bsz, n_head, dim, dim, device=w.device, dtype=torch.float32)
     else:
         state = state_in.float()
-
-    if qat_on:
-        # state 存 int32：量化步长就是 k·vᵀ 累加器的最小单位 scale_k × scale_v
-        state_step = ((k.abs().amax() / 127.0) * (v.abs().amax() / 127.0)).clamp_min(1e-12)
 
     # 块间串行：每块解出 SA、算出 y、推进状态。块内已全部并行，这里只剩 T/L 次迭代。
     ys = []

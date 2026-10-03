@@ -1,7 +1,7 @@
 """数据管线：把清洗后的 jsonl 变成可以直接喂模型的字节窗口。
 
 预训练：`pretrain_clean.jsonl` 的正文按顺序拼成一条 token 流（binidx 的做法），
-按 `ctx_len` 切窗口，**不做长度剔除**（PLAN §5.3.3）。流落到 `built/pretrain.bin`，
+按 `ctx_len` 切窗口，**不做长度剔除**。流落到 `built/pretrain.bin`，
 用 np.memmap 随机读，不把 1.2GB 全塞进内存。
 
 SFT：`nana_clean.jsonl` 每条样本本身就是 `user:<内容>\nbot:<内容>`；整条样本
@@ -104,9 +104,11 @@ def build_sft_arrays(jsonl_path, out_dir, ctx_len):
     mask = np.zeros((n, ctx_len), dtype=np.uint8)
     for i, data in enumerate(kept):
         x[i, :len(data)] = data
-        mask[i, :len(data)] = 1
+        # 最后一个位置没有「下一个 token」（y 那里是补的 PAD_ID），必须排除在 loss 之外，
+        # 否则模型会学到「样本结尾之后吐字节 0」
+        mask[i, :max(0, len(data) - 1)] = 1
     y = np.full((n, ctx_len), PAD_ID, dtype=np.uint8)
-    y[:, :-1] = x[:, 1:]  # 最后一个位置没有下一个 token，loss 由 mask 置零
+    y[:, :-1] = x[:, 1:]
 
     np.save(x_path, x)
     np.save(os.path.join(out_dir, "sft_y.npy"), y)

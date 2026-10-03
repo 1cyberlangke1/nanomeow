@@ -4,7 +4,7 @@
     python -m src.train --stage pretrain
     python -m src.train --stage sft --init-from out/pretrain/pretrain.pth
 
-精度口径（PLAN §6.1）：参数是 fp32 master，前向/反向计算走 bf16 autocast
+精度口径：参数是 fp32 master，前向/反向计算走 bf16 autocast
 ——这就是参考实现 `--precision bf16` 的含义，不是 fp32 训练；wkv7 递推内部
 额外强制 fp32（见 src/wkv7.py 的说明）。
 """
@@ -63,12 +63,18 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", choices=["pretrain", "sft"], required=True)
     p.add_argument("--ctx-len", type=int, default=512)
+    p.add_argument("--wkv-chunk", type=int, default=16, help="分块 wkv7 的块长；数学等价，只影响速度与三角求解精度")
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--steps", type=int, default=2000)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--min-lr", type=float, default=1e-5)
-    p.add_argument("--warmup-steps", type=int, default=50)
-    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--epochs", type=int, default=1, help="跑几遍数据；1 = 完整一遍")
+    p.add_argument("--steps", type=int, default=0,
+                   help="0 = 由 --epochs 按数据量算；正数 = 直接指定总步数")
+    # 默认值照抄参考的 demo 脚本：demo-training-run.sh 用 lr 6e-4 -> 2e-5、
+    # warmup 10、weight_decay 0.001、adam_eps 1e-18；demo-training-run-sft.sh 用
+    # lr 2e-5 -> 1e-6、warmup 10（SFT 那组在命令行显式传，见 HANDOFF）。
+    p.add_argument("--lr", type=float, default=6e-4)
+    p.add_argument("--min-lr", type=float, default=2e-5)
+    p.add_argument("--warmup-steps", type=int, default=10)
+    p.add_argument("--weight-decay", type=float, default=0.001)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--save-every", type=int, default=500)
@@ -76,7 +82,7 @@ def parse_args():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--compile", type=int, default=1, help="1=torch.compile 包裹模型")
     p.add_argument("--qat", type=int, default=1,
-                   help="1=打开 QAT 假量化插桩点（PLAN §7.4）；0=纯 bf16 基线（G2 的参照）")
+                   help="1=全程 QAT（默认）；0=关掉假量化，只做对照")
     p.add_argument("--compile-mode", default="default",
                    help="default / reduce-overhead（CUDA Graph）/ max-autotune")
     p.add_argument("--init-from", default="", help="从 checkpoint 初始化（SFT 接预训练）")
@@ -128,16 +134,28 @@ def build_optimizer(model, args):
                        "weight_decay": args.weight_decay, "lr_scale": 1.0})
     covered = sum(len(g["params"]) for g in groups)
     assert covered == len(list(model.parameters())), "有参数没进 optimizer"
-    return torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.99), eps=1e-8)
+    # betas / eps 同参考 demo 脚本（--beta1 0.9 --beta2 0.99 --adam_eps 1e-18）
+    return torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.99), eps=1e-18)
 
 
 def lr_at(step, args):
-    """输入：当前步数、参数；输出：该步的 base lr（warmup + cosine 到 min_lr）。"""
+    """输入：当前步数、参数；输出：该步的 base lr。
+
+    预期行为：与参考 trainer 的 on_train_batch_start 逐位相同——进度按 **token** 算
+              （step × ctx_len × batch），余弦在 [lr, min_lr] 之间插值，warmup 是乘在
+              余弦结果上的 0.01→1.0 线性因子。
+    """
+    tokens = step * args.ctx_len * args.batch_size
+    total_tokens = args.steps * args.ctx_len * args.batch_size
+    warmup_tokens = args.warmup_steps * args.ctx_len * args.batch_size
+    progress = (tokens - warmup_tokens) / max(1, total_tokens - warmup_tokens)
+    progress = max(0.0, min(1.0, progress))
+    final_factor = args.min_lr / args.lr
+    lr = args.lr * ((0.5 + final_factor / 2)
+                    + (0.5 - final_factor / 2) * math.cos(math.pi * progress))
     if step < args.warmup_steps:
-        return args.lr * (step + 1) / max(1, args.warmup_steps)
-    prog = (step - args.warmup_steps) / max(1, args.steps - args.warmup_steps)
-    prog = min(1.0, prog)
-    return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * prog))
+        lr = lr * (0.01 + 0.99 * step / args.warmup_steps)
+    return lr
 
 
 def loss_fn(logits, y, mask=None):
@@ -170,11 +188,11 @@ def main():
     os.makedirs(CACHE_DIR, exist_ok=True)
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", CACHE_DIR)
 
-    cfg = NanoConfig(ctx_len=args.ctx_len)
+    cfg = NanoConfig(ctx_len=args.ctx_len, wkv_chunk=args.wkv_chunk)
     model = NanoRWKV(cfg)
     print(f"[model] 参数量 {model.parameter_count():,}（int8 约 {model.parameter_count()/1024:.1f} KB）")
 
-    # PLAN §7.4 / §6：QAT 在 P4 打开——在 P2/P3 训好的权重上做量化微调，把部署误差提前吃掉。
+    # QAT 全程打开——假量化从第 0 步就进图，权重一开始就长成「取整之后好用」的形状。
     # 换模块必须在 torch.compile 之前（编译要看到假量化算子）。
     if args.qat:
         model = prepare_qat(model)
@@ -198,6 +216,10 @@ def main():
         print(f"[model] 从 {args.resume} 续训（step={start_step}）")
 
     dataset, use_mask = build_datasets(args, cfg)
+    steps_per_epoch = max(1, len(dataset) // args.batch_size)
+    if args.steps <= 0:
+        args.steps = steps_per_epoch * args.epochs
+    print(f"[data] 样本 {len(dataset)}，一遍 {steps_per_epoch} 步 × {args.epochs} 遍 = 总 {args.steps} 步")
     n_used = args.limit_windows or len(dataset)
     print(f"[data] 共 {len(dataset)} 个样本，本阶段用 {n_used} 个")
     indices = list(range(n_used))
@@ -207,6 +229,11 @@ def main():
 
     net = model
     if args.compile:
+        if device.type == "cuda":
+            # CUDA 扩展的加载（含首次编译）必须在 torch.compile 之前完成：
+            # 否则 dynamo 会 trace 进 load() 的文件操作，产生图断点。
+            from .wkv7_cuda import _load_ext
+            _load_ext()
         torch._dynamo.config.allow_unspec_int_on_nn_module = True
         net = torch.compile(model, mode=args.compile_mode)
         print(f"[compile] torch.compile(mode={args.compile_mode}) 已启用")

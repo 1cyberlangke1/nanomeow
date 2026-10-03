@@ -1,6 +1,6 @@
 """推理生成：逐字节自回归 + 增量 UTF-8 解码，保证不吐乱码。
 
-停止条件（PLAN §5.2）：解码后的文本里出现下一个 `user:`，命中后连标记带后面的
+停止条件：解码后的文本里出现下一个 `user:`，命中后连标记带后面的
 字节一起丢掉；没有专门的终止 token，也没有 EOS。到达 `max_new_tokens` 也停。
 
 「不乱码」的落点：模型一次只吐一个字节，一个 UTF-8 字符可能是 2~4 个字节，
@@ -21,7 +21,7 @@ from .tokenizer import STOP_MARKER, UTF8StreamDecoder, encode
 
 
 def build_prompt(user_text):
-    """输入：用户内容；输出：`user:<内容>\\nbot:` —— 冒号后没有空格（PLAN §5.2）。"""
+    """输入：用户内容；输出：`user:<内容>\\nbot:` —— 冒号后没有空格。"""
     return f"user:{user_text}\nbot:"
 
 

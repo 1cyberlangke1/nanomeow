@@ -36,7 +36,7 @@ def test_hooks_exist_and_start_disabled():
 
 
 def test_prepare_qat_covers_every_linear_embedding_and_hook():
-    """PLAN §7.4：所有 nn.Linear / nn.Embedding 都换成 QAT 版，且每个插桩点都打开。"""
+    """所有 nn.Linear / nn.Embedding 都换成 QAT 版，且每个插桩点都打开。"""
     model = prepare_qat(NanoRWKV(TINY))
     assert not any(type(m) is torch.nn.Linear for m in model.modules())
     assert not any(type(m) is torch.nn.Embedding for m in model.modules())
@@ -78,7 +78,7 @@ def test_qat_enabled_changes_output_and_stays_finite():
 
 
 def test_qat_gradients_reach_every_parameter():
-    """PLAN §10.3：QAT 打开后每个参数依然进计算图，且没有梯度恒为零的死参数。"""
+    """QAT 打开后每个参数依然进计算图，且没有梯度恒为零的死参数。"""
     torch.manual_seed(0)
     model = prepare_qat(NanoRWKV(TINY))
     model.train()
@@ -112,31 +112,55 @@ def test_fake_quant_ste_passes_gradient():
     q = IntxFakeQuantizer(per_tensor_int8())
     x = torch.randn(16, requires_grad=True)
     q(x).sum().backward()
-    assert torch.all(x.grad == 1.0)
+    # 端点精确可表示、没有元素被 clamp；反量化乘回 scale 时 (1/scale)*scale 在 fp 下
+    # 不等于 1，梯度带 1 个 ulp 的误差
+    assert torch.allclose(x.grad, torch.ones_like(x.grad), atol=1e-6)
 
 
 def test_per_row_quant_matches_manual():
-    """per-row 对称 int8 必须等于手算：round(w / (max|w_row|/127)) 再乘回 scale。"""
+    """per-row 对称 int8 必须等于手算：正负端各自除以自己的边界，取大的那个作 scale。"""
     q = IntxFakeQuantizer(per_row_int8())
     w = torch.tensor([[0.0, 1.0, -2.0], [3.0, 0.0, 0.0]])
-    scale = torch.tensor([[2.0 / 127.0], [3.0 / 127.0]])
-    expect = torch.round(w / scale).clamp(-127, 127) * scale
+    # 第 0 行负端 2/128 大于正端 1/127，取它；第 1 行只有正端 3/127
+    scale = torch.tensor([[2.0 / 128.0], [3.0 / 127.0]])
+    expect = torch.round(w / scale).clamp(-128, 127) * scale
     assert torch.allclose(q(w), expect, atol=1e-6)
+    assert torch.allclose(q.scale.flatten(), scale.flatten(), atol=1e-6)
 
 
-def test_per_tensor_range_is_symmetric_127():
-    """PLAN §7.1：对称、无 zero-point，范围必须是 [-127, 127] 而不是 [-128, 127]。"""
+def test_per_tensor_range_matches_torchao_int8():
+    """对称、无 zero-point，范围取 torchao 的 int8 默认 [-128, 127]，且端点必须精确可表示。"""
     q = IntxFakeQuantizer(per_tensor_int8())
-    assert q.config.quant_min == -127 and q.config.quant_max == 127
+    assert q.config.quant_min == -128 and q.config.quant_max == 127
     x = torch.tensor([[-1.0, 0.5]])
     out = q(x)
-    # scale = max|x| / 127 = 1/127；-1.0 正好落在 -127 上，0.5 取整到 64
-    assert torch.allclose(q.scale, torch.tensor(1.0 / 127.0))
-    assert torch.allclose(out, torch.tensor([[-1.0, 64.0 / 127.0]]), atol=1e-6)
+    # 负端 1/128 大于正端 0.5/127，取它；两端分别精确落在 -128 和 +64 上，没有饱和
+    assert torch.allclose(q.scale, torch.tensor(1.0 / 128.0))
+    assert torch.allclose(out, torch.tensor([[-1.0, 0.5]]), atol=1e-6)
+
+
+def test_scale_arithmetic_is_fp32_not_input_dtype():
+    """scale 的算术必须在 fp32 里做，不能落回 input.dtype。
+
+    判据：取 max/127 不能精确落在 bf16 网格上的输入，算出的 scale 必须**不在** bf16 网格上。
+    回归点：算术一旦落回 input.dtype，eager 会先把 scale 做 bf16 舍入，而 torch.compile 会把
+    这一步提升到 fp32 —— 两条路得到不同的量化步长，整张量化网格挪一格（实测 bf16 输入下
+    448 万个元素不同，scale 0.044921875 vs 0.04502952844）。
+    """
+    q = IntxFakeQuantizer(per_tensor_int8())
+    x = torch.full((4, 8), 5.71875, dtype=torch.bfloat16)
+    q(x)
+
+    expect = torch.tensor(5.71875, dtype=torch.float32) / 127
+    assert not torch.equal(expect, expect.to(torch.bfloat16).to(torch.float32)), (
+        "这组输入的 scale 在 bf16 下可精确表示，测不出回归，换一组输入")
+    assert q.scale.dtype == torch.float32
+    assert torch.equal(q.scale, expect), (
+        f"scale={q.scale.item()}，应为 fp32 的 {expect.item()}：算术被按 input.dtype 做了")
 
 
 def test_compile_preserves_fake_quant():
-    """PLAN §7.4：torch.compile 之后量化点不能被折叠成 no-op。
+    """torch.compile 之后量化点不能被折叠成 no-op。
 
     判据：编译后的输出要等于 eager 的 QAT 输出，且**不等于**关掉量化的输出——
     后者正是 round/clamp 被折叠掉时会出现的症状。

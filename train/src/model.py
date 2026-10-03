@@ -1,18 +1,18 @@
 """nanomeow 的 RWKV-7 x070 模型：`tmp/Mini_RWKV_7/src/model.py` 的逐段移植 + QAT 插桩。
 
-移植原则（PLAN §3 / §6.5）：
+移植原则：
 
 - 算式、组件、初始化、常量逐段照抄参考，**一个组件都不砍，只缩维度**（参考里维度本来
   就由 args 驱动，这里换成 `NanoConfig`）。
-- 只去掉参考的训练框架依赖（pytorch-lightning / deepspeed / rwkvfla / wandb）与 CUDA
-  扩展：`token_shift` / `fused_addcmul_rwkv7` / `fused_k_rwkv7` 换成 rwkvfla 的纯 torch
-  等价写法，`RUN_CUDA_RWKV7g` 换成 `src/wkv7.py` 的纯 torch 分块版（PLAN §6.4：不手写
-  CUDA 算子）。
+- 只去掉参考的训练框架依赖（pytorch-lightning / deepspeed / rwkvfla / wandb）：
+  `token_shift` / `fused_addcmul_rwkv7` / `fused_k_rwkv7` 换成 rwkvfla 的纯 torch
+  等价写法，`RUN_CUDA_RWKV7g` 的纯 torch 分块版在 `src/wkv7.py`，另叠一条
+  `src/wkv7_cuda.py` 的 CUDA 快路径（head_size=8 / chunk=16 且从零状态开始时启用，数值与分块版一致）。
 - 新增参考没有的两样：`RWKVState`（逐 token 推理的跨步状态）与 QAT 插桩点。
 
-QAT 怎么和「逐段移植」共存（PLAN §7.4）：
+QAT 怎么和「逐段移植」共存：
 
-- 移植保持参考的算式一字不改；QAT 只是在 §7.4 列出的**每一条定点边界**上套一层假量化
+- 移植保持参考的算式一字不改；QAT 只是在**每一条定点边界**上套一层假量化
   （`IntxFakeQuantizer`），跟 torchao 把 `nn.Linear` 换成 `FakeQuantizedLinear` 是同一手法。
 - 所有插桩点默认 `enabled=False`，此时是恒等映射，前向与参考**逐位一致**；
   `src/qat.py::prepare_qat()` 打开后，同一个计算图上的边界才变成 int8。
@@ -30,9 +30,9 @@ from .config import NanoConfig
 from .qat import IntxFakeQuantizer, per_row_int8, per_tensor_int8
 from .wkv7 import run_wkv7
 
-# PLAN §10.3：参考的 value residual 是**按层分支**——第 0 层只记录 `v_first`、不做插值
+# 参考的 value residual 是**按层分支**——第 0 层只记录 `v_first`、不做插值
 # （`if self.layer_id == 0: v_first = v`），所以第 0 层的 v0/v1/v2 结构性地拿不到梯度。
-# 按 §10.3 第 3 条，这里是**显式登记**（不是默默跳过）：白名单只允许这一个集合，
+# 这里是**显式登记**（不是默默跳过）：白名单只允许这一个集合，
 # 多出任何一个死参数都必须让测试挂掉。
 DEAD_BY_REFERENCE_BRANCH = frozenset(
     f"blocks.0.att.{name}" for name in ("v0", "v1", "v2")
@@ -51,7 +51,7 @@ def _fq() -> IntxFakeQuantizer:
 def _fq_w() -> IntxFakeQuantizer:
     """输入：无；输出：关闭状态的 per-row int8 假量化器（裸权重矩阵插桩点）。
 
-    预期行为：per-row 就是 per-channel（PLAN §7.1：权重按输出通道对称 int8）。
+    预期行为：per-row 就是 per-channel（权重按输出通道对称 int8）。
     """
     return IntxFakeQuantizer(per_row_int8(), enabled=False)
 
@@ -106,6 +106,7 @@ class RWKV_Tmix_x070(nn.Module):
 
         self.head_size = cfg.head_size
         self.wkv_chunk = cfg.wkv_chunk
+        self.dim_lora = cfg.dim_lora
         self.n_head = cfg.dim_att // self.head_size
         assert cfg.dim_att % self.n_head == 0
         H = self.n_head
@@ -152,26 +153,28 @@ class RWKV_Tmix_x070(nn.Module):
             zigzag[n] = zigzag[n] * abs(zigzag[n])
             www[n] = -6 + 6 * (n / (C - 1)) ** (1 + 1 * ratio_0_to_1 ** 0.3)
 
-        # Increase lora dimension for headdim>64
-        factor = self.head_size / 64
-        D_DECAY_LORA = max(32, int(round((2.5 * (C ** 0.5)) * factor / 32) * 32))  # suggestion
+        # 四组低秩对的 rank 都是 cfg.dim_lora。参考写的是
+        #   D_DECAY_LORA = max(32, int(round((2.5 * (C ** 0.5)) * factor / 32) * 32))
+        # （a/v/g 组系数分别是 2.5 / 1.7 / 5）。那个 max(32, ...) 是给大模型的地板：
+        # 参考实际配置 C=512 / head_size=64 时四组都落在 32~64，即 D/C 约 1/8。
+        # 缩维到 C=32 后照抄地板会得到 D=32=C —— 低秩对退化成满秩 32x32，
+        # 相对容量是参考的 8 倍（实测能把每层 decay 压到数学下界 0.5452，
+        # 等效记忆 ~2 token，模型因此完全不条件于 prompt），所以按同一比例取 D=8。
+        D_DECAY_LORA = D_AAA_LORA = D_MV_LORA = D_GATE_LORA = self.dim_lora
         self.w1 = nn.Parameter(torch.zeros(C, D_DECAY_LORA))
         self.w2 = nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, C), 0.1))
         # !!! 0.5 comes from F.softplus !!!
         self.w0 = nn.Parameter(www.reshape(1, 1, C) + 0.5 + zigzag * 2.5)
 
-        D_AAA_LORA = max(32, int(round((2.5 * (C ** 0.5)) * factor / 32) * 32))  # suggestion
         self.a1 = nn.Parameter(torch.zeros(C, D_AAA_LORA))
         self.a2 = nn.Parameter(ortho_init(torch.zeros(D_AAA_LORA, C), 0.1))
         self.a0 = nn.Parameter(torch.zeros(1, 1, C) - 0.19 + zigzag * 0.3 + linear * 0.4)
 
-        D_MV_LORA = max(32, int(round((1.7 * (C ** 0.5)) * factor / 32) * 32))  # suggestion
         self.v1 = nn.Parameter(torch.zeros(C, D_MV_LORA))
         self.v2 = nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, C), 0.1))
         self.v0 = nn.Parameter(torch.zeros(1, 1, C) + 0.73 - linear * 0.4)
 
         # Note: for some data, you can reduce D_GATE_LORA or even remove this gate
-        D_GATE_LORA = max(32, int(round((5 * (C ** 0.5)) / 32) * 32))  # suggestion
         self.g1 = nn.Parameter(torch.zeros(C, D_GATE_LORA))
         self.g2 = nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, C), 0.1))
 
@@ -193,7 +196,7 @@ class RWKV_Tmix_x070(nn.Module):
         self.output.weight.data.zero_()
         del www, zigzag, linear, ddd
 
-        # PLAN §7.4 插桩点（默认恒等，prepare_qat 才打开）：
+        # 插桩点（默认恒等，prepare_qat 才打开）：
         #   fq_act   —— token-shift 缓冲 / 6 路混合 / 非线性输出 / ln_x 输出 / 残差相加
         #   fq_param —— 逐元素常量 x_r…x_g、w0/a0/v0、k_k/k_a/r_k
         #   fq_w     —— 裸权重矩阵 w1/w2、a1/a2、v1/v2、g1/g2（per-row）
@@ -207,7 +210,7 @@ class RWKV_Tmix_x070(nn.Module):
         """输入：激活 x (..., K)、裸权重 p (K, N)；输出：假量化后的 x @ p。
 
         预期行为：p 按输出通道 per-row int8（p 的存储口径是 (K, N)，先转成 (N, K) 再走
-                  fq_w）、输入与输出激活 per-tensor int8（PLAN §7.4「低秩 matmul 全定点」）。
+                  fq_w）、输入与输出激活 per-tensor int8。
         """
         return self.fq_act(F.linear(self.fq_act(x), self.fq_w(p.transpose(0, 1))))
 
@@ -289,7 +292,7 @@ class RWKV_CMix_x070(nn.Module):
             ddd[0, 0, i] = i / cfg.n_embd
         self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0 ** 4))
 
-        # 参考写的是 args.n_embd * 4；这里用 T1 的 dim_ffn（PLAN §4，只缩维度不砍组件）
+        # 参考写的是 args.n_embd * 4；这里用 T1 的 dim_ffn（只缩维度不砍组件）
         self.key = nn.Linear(cfg.n_embd, cfg.dim_ffn, bias=False)
         self.value = nn.Linear(cfg.dim_ffn, cfg.n_embd, bias=False)
 
@@ -334,8 +337,7 @@ class Block(nn.Module):
     def _norm(self, ln, x):
         """输入：LayerNorm 模块、x；输出：定点化的 LayerNorm 结果。
 
-        预期行为：weight/bias 走 int8 定点常量、输出再量化回 int8
-                  （PLAN §7.4「ln0 / ln1 / ln2 定点」）。
+        预期行为：weight/bias 走 int8 定点常量、输出再量化回 int8。
         """
         return self.fq_act(F.layer_norm(
             x, (self.cfg.n_embd,),
@@ -362,7 +364,7 @@ class RWKVState:
     输入：由 `RWKVState.zeros` 构造，或由 `NanoRWKV.forward` 返回。
     输出：可直接传回 `NanoRWKV.forward` 的 state。
     内容：每层的 time-shift 上一 token（att / ffn 各一份，dtype 跟随隐藏状态）与
-          wkv 状态 (B,H,N,N) fp32（部署时存 int32，见 PLAN §7.1）。
+          wkv 状态 (B,H,N,N) fp32（部署时存 int32）。
     """
 
     __slots__ = ("att_prev", "ffn_prev", "wkv_state")
@@ -488,13 +490,17 @@ class NanoRWKV(nn.Module):
 
         # 参考原样：先分配一块空的 v_first，第 0 层一定会覆盖它
         v_first = torch.empty_like(x)
-        if state is None:
+        fresh = state is None
+        if fresh:
             state = RWKVState.zeros(B, self.cfg, x.device, x.dtype)
 
         att_next, ffn_next, wkv_next = [], [], []
         for i, block in enumerate(self.blocks):
+            # 全零 state 与 None 等价；传 None 时 wkv7 才能走 CUDA kernel 快路径
+            # （kernel 只支持从零状态开始）。外部传进来的非空 state 仍走分块实现。
+            wkv_in = None if fresh else state.wkv_state[i]
             x, v_first, wkv_out, a_next, f_next = block(
-                x, v_first, state.att_prev[i], state.ffn_prev[i], state.wkv_state[i]
+                x, v_first, state.att_prev[i], state.ffn_prev[i], wkv_in
             )
             att_next.append(a_next)
             ffn_next.append(f_next)
@@ -504,7 +510,7 @@ class NanoRWKV(nn.Module):
             x, (self.cfg.n_embd,),
             self.fq_param(self.ln_out.weight), self.fq_param(self.ln_out.bias),
             self.ln_out.eps))
-        # PLAN §7.4：head 走 QATLinear，logits 存 int8
+        # head 走 QATLinear，logits 存 int8
         x = self.fq_act(self.head(x))
         return x, RWKVState(att_next, ffn_next, wkv_next)
 

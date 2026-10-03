@@ -60,7 +60,7 @@ def test_initial_loss_matches_logit_variance():
 
 
 def test_all_params_receive_nonzero_grad():
-    """PLAN §10.3：每个参数都必须进计算图，且训练起来之后梯度非零（白名单为空）。
+    """每个参数都必须进计算图，且训练起来之后梯度非零（白名单为空）。
 
     分两步查，因为第 0 步的零梯度是官方初始化的**预期结果**、不是漏训：
     `att.output.weight` 与 `ffn.value.weight` 被官方初始化成 0，于是第 0 步
@@ -71,7 +71,7 @@ def test_all_params_receive_nonzero_grad():
     model.train()
     idx, y = _batch()
 
-    # 第一步：所有参数都要挂在计算图上（grad 非 None）。唯一的例外是 PLAN §10.3
+    # 第一步：所有参数都要挂在计算图上（grad 非 None）。唯一的例外是
     # 显式登记的第 0 层 v0/v1/v2——参考的按层分支让它们结构性死掉。
     logits, _ = model(idx)
     _loss(logits, y).backward()
@@ -104,7 +104,7 @@ def test_all_params_receive_nonzero_grad():
 
 
 def test_optimizer_covers_every_parameter():
-    """PLAN §10.3：每个参数都要进 optimizer。"""
+    """每个参数都要进 optimizer。"""
     model = NanoRWKV(TINY)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
     covered = sum(len(g["params"]) for g in opt.param_groups)

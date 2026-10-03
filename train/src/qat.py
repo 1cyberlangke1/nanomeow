@@ -1,4 +1,4 @@
-"""QAT：把部署时的定点边界搬进训练（PLAN §7.1 / §7.4）。
+"""QAT：把部署时的定点边界搬进训练。
 
 本文件是 `tmp/ao`（pytorch/ao 的 torchao）的**移植**，不是自己写的：算子与模块
 逐段照抄 torchao 的对应实现，只删掉本模型用不到的分支（非对称 / 分组 / float8 /
@@ -16,7 +16,7 @@ int4 / range learning / 静态 qparam）。
 | `_get_reduction_params` | 同上 |
 | `_quantize_affine_no_zero_point_no_dtype_cast` | 同上 |
 | `_dequantize_affine_no_zero_point_no_dtype_check` | 同上 |
-| `_choose_qparams_affine`（只留 SYMMETRIC 分支） | 同上 |
+| `_choose_qparams_affine`（留 SYMMETRIC / SYMMETRIC_NO_CLIPPING_ERR） | 同上 |
 | `_do_fake_quantize_affine` / `_fake_quantize_affine` | 同上 |
 | `_fake_quantize_per_channel_group` | `torchao/quantization/qat/utils.py` |
 | `IntxFakeQuantizeConfig` | `torchao/quantization/qat/fake_quantize_config.py` |
@@ -24,9 +24,9 @@ int4 / range learning / 静态 qparam）。
 | `FakeQuantizedLinear` | `torchao/quantization/qat/linear.py` |
 | `FakeQuantizedEmbedding` | `torchao/quantization/qat/embedding.py` |
 
-本模型的口径（PLAN §7.1，一条都不许改）：
+本模型的口径（一条都不许改）：
 
-- 权重 **int8**，per-channel（per-row）对称，范围 `[-127, 127]`（不是 `[-128, 127]`）。
+- 权重 **int8**，per-channel（per-row）对称、无 zero-point，范围 `[-128, 127]`，映射用 `SYMMETRIC_NO_CLIPPING_ERR`（两端精确可表示，不饱和）。
 - 激活 **int8**，per-tensor 动态（运行时求 max -> scale）。
 - 累加 int32；对称、无 zero-point；不做分组。
 """
@@ -38,8 +38,9 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-# PLAN §7.1：对称、无 zero-point，所以范围是 [-127, 127] 而不是 [-128, 127]
-INT8_MIN = -127
+# torchao 的对称 int8 口径：quant_min / quant_max 取 dtype 全域，即 -128 / 127。
+# 必须配 MappingType.SYMMETRIC_NO_CLIPPING_ERR，理由见 _choose_qparams_affine。
+INT8_MIN = -128
 INT8_MAX = 127
 
 # torchao 原表里 int32 是「载体」dtype（_fake_quantize_per_channel_group 用它做中间量），
@@ -103,9 +104,11 @@ def get_block_size(input_shape: Tuple[int, ...], granularity: Granularity) -> Tu
 
 
 class MappingType(enum.Enum):
-    """浮点到整数的映射方式（只留本模型用的 SYMMETRIC）。"""
+    """浮点到整数的映射方式（移植 torchao，只留对称的两个分支）。"""
 
     SYMMETRIC = "symmetric"
+    # 正负端各自除以自己的边界再取大的那个：两端都精确可表示，不会出界饱和
+    SYMMETRIC_NO_CLIPPING_ERR = "symmetric_no_clipping_err"
 
 
 class ZeroPointDomain(enum.Enum):
@@ -315,10 +318,10 @@ def _choose_qparams_affine(
     输入：float 张量、映射方式名、block_size、目标 dtype、可选范围与 eps。
     输出：(scale, zero_point)；对称口径下 zero_point 恒为 0。
     预期行为：scale = max(|x|) / ((quant_max - quant_min) / 2)，夹到 eps 以上；
-              quant_min=-127、quant_max=127 时正好是 PLAN §7.1 的 max/127。
+              quant_min=-128、quant_max=127 时正好是 max/127.5。
     """
     quant_min, quant_max = _get_and_check_qmin_qmax(target_dtype, quant_min, quant_max)
-    assert mapping_type in [MappingType.SYMMETRIC.name], (
+    assert mapping_type in [MappingType.SYMMETRIC.name, MappingType.SYMMETRIC_NO_CLIPPING_ERR.name], (
         f"Unsupported mapping type: {mapping_type}"
     )
 
@@ -339,12 +342,29 @@ def _choose_qparams_affine(
     min_val = torch.amin(input, dim=reduction_dims, keepdim=keepdim)
     max_val = torch.amax(input, dim=reduction_dims, keepdim=keepdim)
 
+    # 归约之后的算术统一放进 fp32。input 是 bf16 时，eager 会按 bf16 算
+    # `max_val_pos / 127.5`（Python 标量不提升张量类型），scale 先被 bf16 舍入；
+    # 而 inductor 会把这一步提升到 fp32，两条路因此得到不同的量化步长（实测 seed 1：
+    # 0.044921875 vs 0.04502952844，整张量化网格挪一格）。显式转 fp32 让两者一致，
+    # 也与 int8 推理里 scale 是 fp32 的口径一致。
+    min_val = min_val.float()
+    max_val = max_val.float()
+
     min_val_neg = torch.min(min_val, torch.zeros_like(min_val))
     max_val_pos = torch.max(max_val, torch.zeros_like(max_val))
 
     # scales
-    max_val_pos = torch.max(-min_val_neg, max_val_pos)
-    scale = max_val_pos / (float(quant_max - quant_min) / 2)
+    if mapping_type == MappingType.SYMMETRIC.name:
+        max_val_pos = torch.max(-min_val_neg, max_val_pos)
+        scale = max_val_pos / (float(quant_max - quant_min) / 2)
+    else:
+        assert mapping_type == MappingType.SYMMETRIC_NO_CLIPPING_ERR.name
+        # SYMMETRIC 的 scale 是 max / ((qmax - qmin) / 2)，在 [-128, 127] 里就是 max / 127.5，
+        # 正端取整到 128 会饱和；整张都是极值的常数张量因此被 _ClampSTE 全部归零。
+        # 这里正负端各除自己的边界取大者，两端分别精确落在 quant_min / quant_max 上。
+        smin = min_val_neg / float(quant_min)
+        smax = max_val_pos / float(quant_max)
+        scale = torch.where(smin > smax, smin, smax)
     zero_point = torch.full_like(scale, int((quant_max + quant_min + 1) / 2))
     scale = torch.clamp(scale, min=eps)
 
@@ -511,7 +531,7 @@ class IntxFakeQuantizeConfig:
           是否动态 / eps / quant_min / quant_max。
     输出：可直接构造 IntxFakeQuantizer 的配置对象。
     预期行为：quant_min / quant_max 未给时按 dtype 取默认上界（int8 是 -128..127）；
-              本模型统一显式传 -127 / 127（PLAN §7.1）。
+              本模型显式传 -128 / 127，与 torchao 一致。
     """
 
     dtype: torch.dtype
@@ -537,7 +557,7 @@ def per_tensor_int8() -> IntxFakeQuantizeConfig:
     return IntxFakeQuantizeConfig(
         dtype=torch.int8,
         granularity=PerTensor(),
-        mapping_type=MappingType.SYMMETRIC,
+        mapping_type=MappingType.SYMMETRIC_NO_CLIPPING_ERR,
         scale_precision=torch.float32,
         zero_point_precision=torch.int32,
         zero_point_domain=ZeroPointDomain.NONE,
@@ -552,7 +572,7 @@ def per_row_int8() -> IntxFakeQuantizeConfig:
     return IntxFakeQuantizeConfig(
         dtype=torch.int8,
         granularity=PerRow(-1),
-        mapping_type=MappingType.SYMMETRIC,
+        mapping_type=MappingType.SYMMETRIC_NO_CLIPPING_ERR,
         scale_precision=torch.float32,
         zero_point_precision=torch.int32,
         zero_point_domain=ZeroPointDomain.NONE,
@@ -679,7 +699,7 @@ class IntxFakeQuantizer(FakeQuantizerBase):
     def _should_compute_qparams(self) -> bool:
         """输入：无；输出：是否要重算 qparam。
 
-        预期行为：动态量化每次前向都重算（PLAN §7.1 的「运行时求 max」）；静态量化只在
+        预期行为：动态量化每次前向都重算（「运行时求 max」）；静态量化只在
                   首次前向算一次。
         """
         return (

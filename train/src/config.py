@@ -1,7 +1,7 @@
 """nanomeow 的模型与训练超参。
 
-T1 是 PLAN.md 的基线配置：V=256 / L=2 / C=32 / head_size=8 / n_head=4 /
-dim_ffn=64；低秩 rank 不单独设，按原版公式由 C 与 head_size 推出。
+基线配置：V=256 / L=2 / C=32 / head_size=8 / n_head=4 /
+dim_ffn=64；低秩 rank 见 `dim_lora`。
 """
 
 from dataclasses import dataclass
@@ -21,6 +21,7 @@ class NanoConfig:
     dim_att: int = 32          # 参考的 args.dim_att；参考里必须等于 n_embd
     head_size: int = 8
     dim_ffn: int = 64
+    dim_lora: int = 8          # 四组低秩对的 rank；取 8 是照参考的 D/C 比例缩维，见 lora_rank
     ctx_len: int = 512
     wkv_chunk: int = 16        # 分块 wkv7 的块长，对齐参考实现的 CHUNK_LEN
 
@@ -40,9 +41,15 @@ class NanoConfig:
 
     @property
     def lora_rank(self) -> int:
-        """四组低秩对的 rank（原版公式；逐组系数略有不同，见 Tmix）。"""
-        factor = self.head_size / 64
-        return max(32, int(round((2.5 * (self.n_embd ** 0.5)) * factor / 32) * 32))
+        """四组低秩对的 rank。
+
+        输入：无。输出：D。
+        预期行为：参考的 `max(32, ...)` 是给大模型的地板，参考实际配置
+                  C=512 / head_size=64 时 D_DECAY_LORA=64，即 D/C = 1/8。
+                  缩维到 C=32 后照抄地板会得到 D=32=C（低秩对退化成满秩，
+                  相对容量是参考的 8 倍），所以按同一比例取 D=8。
+        """
+        return self.dim_lora
 
     def param_count(self) -> int:
         """按模型结构算参数量，用于和实测值对账。
@@ -50,18 +57,13 @@ class NanoConfig:
         单层 = 4*C*C（r/k/v/output）
              + 11*C（x_r..x_g + Cmix.x_k + ln1/ln2 的 weight+bias）
              + 8*C（w0,a0,v0,k_k,k_a,r_k + ln_x 的 weight+bias）
-             + 2*C*(D_decay + D_aaa + D_mv + D_gate)（四组低秩对）
+             + 2*C*4*D（四组低秩对，rank 都是 dim_lora）
              + 2*C*dim_ffn（Cmix key/value）
         全局 = 2*C（ln_out）+ V*C（emb）+ V*C（head，独立不共享）+ 2*C（第 0 层的 ln0）
         """
         c, f, v, l = self.n_embd, self.dim_ffn, self.vocab_size, self.n_layer
-        factor = self.head_size / 64
-        d_decay = max(32, int(round((2.5 * (c ** 0.5)) * factor / 32) * 32))
-        d_aaa = max(32, int(round((2.5 * (c ** 0.5)) * factor / 32) * 32))
-        d_mv = max(32, int(round((1.7 * (c ** 0.5)) * factor / 32) * 32))
-        d_gate = max(32, int(round((5 * (c ** 0.5)) / 32) * 32))
         per_layer = (4 * c * c + 11 * c + 8 * c
-                     + 2 * c * (d_decay + d_aaa + d_mv + d_gate)
+                     + 2 * c * 4 * self.dim_lora
                      + 2 * c * f)
         return l * per_layer + 2 * c + v * c + v * c + 2 * c
 

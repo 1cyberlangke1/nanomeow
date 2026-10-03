@@ -1,6 +1,6 @@
 """字节级 tokenizer：编码 = UTF-8 字节流，解码 = 字节流。
 
-不做 BPE、不训分词器（PLAN.md §5.1）。V = 256，任意文本都能编码，不存在 OOV，
+不做 BPE、不训分词器。V = 256，任意文本都能编码，不存在 OOV，
 MCU 端零分词逻辑——串口收到的字节就是 token。
 
 生成时模型一次只吐一个字节，单个字节可能只是某个 UTF-8 字符的前半截，
@@ -12,7 +12,7 @@ from typing import Iterable, List
 
 VOCAB_SIZE = 256
 PAD_ID = 0                 # SFT 批次补齐用；训练时按位置屏蔽，不参与 loss
-STOP_MARKER = "user:"      # 生成到下一个 user: 就停（PLAN.md §5.2）
+STOP_MARKER = "user:"      # 生成到下一个 user: 就停
 
 
 def encode(text: str) -> List[int]:
