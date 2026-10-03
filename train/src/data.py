@@ -1,0 +1,140 @@
+"""数据管线：把清洗后的 jsonl 变成可以直接喂模型的字节窗口。
+
+预训练：`pretrain_clean.jsonl` 的正文按顺序拼成一条 token 流（binidx 的做法），
+按 `ctx_len` 切窗口，**不做长度剔除**（PLAN §5.3.3）。流落到 `built/pretrain.bin`，
+用 np.memmap 随机读，不把 1.2GB 全塞进内存。
+
+SFT：`nana_clean.jsonl` 每条样本本身就是 `user:<内容>\nbot:<内容>`；整条样本
+UTF-8 字节数 > `ctx_len` 的丢弃，剩下的右补 `PAD_ID` 并给出 mask
+（补位不能参与 loss，否则模型会学着吐 NUL 字节）。
+
+两类产物都在 `train/dataset/built/` 下，属于中间产物（已 .gitignore）。
+"""
+
+import json
+import os
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+from .tokenizer import PAD_ID, encode
+
+
+def _iter_texts(jsonl_path):
+    """输入：jsonl 路径；输出：逐行的 `text` 字段（生成器，不占内存）。"""
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            text = obj.get("text")
+            if text:
+                yield text
+
+
+def build_pretrain_stream(jsonl_path, bin_path):
+    """把 jsonl 的正文拼成一条 uint8 字节流落盘。
+
+    输入：源 jsonl、目标 .bin 路径。
+    输出：字节总数。目标文件已存在且非空时直接返回其大小（幂等，不重复跑）。
+    """
+    if os.path.exists(bin_path) and os.path.getsize(bin_path) > 0:
+        return os.path.getsize(bin_path)
+
+    os.makedirs(os.path.dirname(bin_path), exist_ok=True)
+    total = 0
+    tmp_path = bin_path + ".part"
+    with open(tmp_path, "wb") as out:
+        for text in _iter_texts(jsonl_path):
+            data = text.encode("utf-8")
+            out.write(data)
+            total += len(data)
+    os.replace(tmp_path, bin_path)
+    return total
+
+
+class PretrainDataset(Dataset):
+    """预训练窗口数据集。
+
+    输入：字节流 .bin 路径、窗口长度 ctx_len。
+    输出：__getitem__ 返回 (x (T,) int64, y (T,) int64)，y 是 x 右移一位。
+    """
+
+    def __init__(self, bin_path, ctx_len):
+        self.ctx_len = ctx_len
+        self.stream = np.memmap(bin_path, dtype=np.uint8, mode="r")
+        self.n_window = max(1, (len(self.stream) - 1) // ctx_len)
+
+    def __len__(self):
+        return self.n_window
+
+    def __getitem__(self, i):
+        start = i * self.ctx_len
+        window = self.stream[start:start + self.ctx_len + 1].astype(np.int64)
+        x = torch.from_numpy(window[:-1])
+        y = torch.from_numpy(window[1:].copy())
+        return x, y
+
+
+def build_sft_arrays(jsonl_path, out_dir, ctx_len):
+    """把 SFT 样本编码、卡长度、右补 PAD，落成三份 .npy。
+
+    输入：源 jsonl、输出目录、窗口长度。
+    输出：dict，含保留/丢弃条数与数组形状。产物已存在时直接读回来（幂等）。
+    """
+    x_path = os.path.join(out_dir, "sft_x.npy")
+    meta_path = os.path.join(out_dir, "sft_meta.json")
+    if os.path.exists(x_path) and os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    os.makedirs(out_dir, exist_ok=True)
+    kept, dropped = [], 0
+    for text in _iter_texts(jsonl_path):
+        data = encode(text)
+        if len(data) > ctx_len:
+            dropped += 1
+            continue
+        kept.append(data)
+
+    n = len(kept)
+    x = np.full((n, ctx_len), PAD_ID, dtype=np.uint8)
+    mask = np.zeros((n, ctx_len), dtype=np.uint8)
+    for i, data in enumerate(kept):
+        x[i, :len(data)] = data
+        mask[i, :len(data)] = 1
+    y = np.full((n, ctx_len), PAD_ID, dtype=np.uint8)
+    y[:, :-1] = x[:, 1:]  # 最后一个位置没有下一个 token，loss 由 mask 置零
+
+    np.save(x_path, x)
+    np.save(os.path.join(out_dir, "sft_y.npy"), y)
+    np.save(os.path.join(out_dir, "sft_mask.npy"), mask)
+    meta = {"kept": n, "dropped_over_ctx": dropped, "ctx_len": ctx_len}
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return meta
+
+
+class SFTDataset(Dataset):
+    """SFT 数据集（已补齐、已带 mask）。
+
+    输入：build_sft_arrays 的输出目录。
+    输出：__getitem__ 返回 (x (T,) int64, y (T,) int64, mask (T,) float32)。
+    """
+
+    def __init__(self, out_dir):
+        self.x = np.load(os.path.join(out_dir, "sft_x.npy"))
+        self.y = np.load(os.path.join(out_dir, "sft_y.npy"))
+        self.mask = np.load(os.path.join(out_dir, "sft_mask.npy"))
+
+    def __len__(self):
+        return self.x.shape[0]
+
+    def __getitem__(self, i):
+        return (
+            torch.from_numpy(self.x[i].astype(np.int64)),
+            torch.from_numpy(self.y[i].astype(np.int64)),
+            torch.from_numpy(self.mask[i].astype(np.float32)),
+        )

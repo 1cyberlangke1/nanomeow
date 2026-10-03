@@ -39,8 +39,11 @@ hs_err_pid*
 tmp/
 
 # 数据集 / 语料（体积大，不入库；用 train/notebooks/prepare_dataset.ipynb 重新生成）
-# 原始下载文件、清洗产物、meta 与 HF 下载缓存都在里面
+# 原始下载文件、清洗产物、meta、HF 下载缓存，以及 built/ 里的字节流与 SFT 数组
 train/dataset/
+
+# 训练产物（checkpoint / inductor 编译缓存 / 日志）
+train/out/
 
 # Python 虚拟环境 / 缓存
 .venv/

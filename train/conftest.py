@@ -1,0 +1,1 @@
+"""让 tests/ 能 `from src... import`：把 train/ 放进 sys.path。"""
