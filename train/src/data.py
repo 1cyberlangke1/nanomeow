@@ -133,13 +133,15 @@ def build_sft_arrays(jsonl_path, out_dir, ctx_len):
         x[i, :len(data)] = data
         # 最后一位是 <ETX>，它没有「下一个 token」（y 那里是补的 PAD_ID），必须排除在
         # loss 之外；倒数第二位正好学到「这里该吐 <ETX> 了」，序列结束信号就是这么训出来的。
-        # 模板前缀 `user:<内容>\nbot:`（含 `bot:`）同样排除：推理时它由调用方给定，
-        # 模型只需要学「给定前缀之后该吐什么」。
+        # 模板前缀 `user:<内容>\nbot:` 本身不参与 loss：推理时它由调用方给定，模型只需要学
+        # 「给定前缀之后该吐什么」。但 loss 的口径是「位置 t 预测 y[t] = x[t+1]」，所以答案的
+        # 第一个字节 x[start] 由位置 start-1 预测，mask 必须从 start-1 起 —— 少这一格，模型就
+        # 永远学不到「该用哪个字节开头」，而字节级模型里那正是「选哪一句回答」的决定点。
         start = answer_start(data)
         if start is None:
             no_template += 1
             start = 0
-        mask[i, start:max(start, len(data) - 1)] = 1
+        mask[i, max(0, start - 1):max(start, len(data) - 1)] = 1
     y = np.full((n, ctx_len), PAD_ID, dtype=np.uint8)
     y[:, :-1] = x[:, 1:]
 

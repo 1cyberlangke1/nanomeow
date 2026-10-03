@@ -15,7 +15,7 @@ from ref.fixed import mul, normalize, value  # noqa: E402
 from ref.int8_model import QTensor  # noqa: E402
 from ref.wkv7 import wkv7_recurrence  # noqa: E402
 
-CKPT = HERE.parents[2] / "train" / "out" / "sft_dyn_fine" / "sft_step2750.pth"
+CKPT = HERE.parents[2] / "train" / "out" / "sft_para8" / "sft.pth"
 N = 2                      # 测试用的 head_size
 Q7 = normalize(1, -7)      # 值 = 2^-7 的 scale（激活 / 向量）
 Q9 = normalize(1, -9)      # 第一趟的 k / v：step = 2^-18

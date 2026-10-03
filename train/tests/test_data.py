@@ -17,7 +17,7 @@ def _write_jsonl(path, texts):
 
 
 def test_build_sft_arrays_masks_prompt_and_last_position(tmp_path):
-    """模板前缀（user:<内容>\\nbot:）与末尾 <ETX> 都不参与 loss，只有回答段参与。"""
+    """模板前缀与末尾 <ETX> 不参与 loss；回答段（含第 0 字节）必须全部参与。"""
     texts = ["user:你好\nbot:喵", "user:ab\nbot:cd"]
     src = tmp_path / "s.jsonl"
     _write_jsonl(src, texts)
@@ -38,8 +38,10 @@ def test_build_sft_arrays_masks_prompt_and_last_position(tmp_path):
         # 回答段从 `\nbot:` 之后开始；它之前（含 `bot:` 本身）整段不参与 loss
         start = raw.index(b"\nbot:") + len(b"\nbot:")
         assert n == len(raw) + 1 and int(data[-1]) == ETX_ID
-        assert mask[i, :start].sum() == 0
-        assert int(mask[i, start:n - 1].sum()) == n - 1 - start
+        # 位置 start-1 负责预测答案第 0 字节，必须参与 loss；再往前才是纯前缀
+        assert mask[i, :start - 1].sum() == 0
+        assert mask[i, start - 1] == 1
+        assert int(mask[i, start - 1:n - 1].sum()) == n - 1 - (start - 1)
         assert mask[i, n - 1] == 0
         # 有效位上 y 就是下一个字节；倒数第二位学到的正是「这里该吐 <ETX>」
         assert np.array_equal(x[i, :n], data)
