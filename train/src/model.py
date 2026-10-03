@@ -120,7 +120,9 @@ class RWKV_Tmix_x070(nn.Module):
             ddd[0, 0, i] = i / C
 
         self.x_r = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
-        self.x_w = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
+        # x_w 只服务于输入相关 decay；静态 decay 下它不进任何计算，所以不注册。
+        if cfg.dynamic_decay:
+            self.x_w = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
         self.x_k = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
         self.x_v = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
         self.x_a = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
@@ -161,8 +163,10 @@ class RWKV_Tmix_x070(nn.Module):
         # 相对容量是参考的 8 倍（实测能把每层 decay 压到数学下界 0.5452，
         # 等效记忆 ~2 token，模型因此完全不条件于 prompt），所以按同一比例取 D=8。
         D_DECAY_LORA = D_AAA_LORA = D_MV_LORA = D_GATE_LORA = self.dim_lora
-        self.w1 = nn.Parameter(torch.zeros(C, D_DECAY_LORA))
-        self.w2 = nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, C), 0.1))
+        # 同上：静态 decay 下这一对不进任何计算，不注册（否则是梯度恒 0 的死参数）。
+        if cfg.dynamic_decay:
+            self.w1 = nn.Parameter(torch.zeros(C, D_DECAY_LORA))
+            self.w2 = nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, C), 0.1))
         # !!! 0.5 comes from F.softplus !!!
         self.w0 = nn.Parameter(www.reshape(1, 1, C) + 0.5 + zigzag * 2.5)
 
@@ -221,21 +225,26 @@ class RWKV_Tmix_x070(nn.Module):
     def forward(self, x, v_first, att_prev=None, wkv_state=None):
         B, T, C = x.size()
         xx = self.fq_act(token_shift(self.time_shift, x, att_prev))
-        xr, xw, xk, xv, xa, xg = fused_addcmul_rwkv7(
-            x, xx,
-            self.fq_param(self.x_r), self.fq_param(self.x_w), self.fq_param(self.x_k),
-            self.fq_param(self.x_v), self.fq_param(self.x_a), self.fq_param(self.x_g),
-        )
-        xr, xw, xk, xv, xa, xg = [self.fq_act(t) for t in (xr, xw, xk, xv, xa, xg)]
+        # 输入相关 decay 时混合系数多一路 x_w（只有 decay 用它）；静态 decay 没有这一路。
+        w_coef = [self.x_w] if self.cfg.dynamic_decay else []
+        shifted = [self.fq_act(t) for t in fused_addcmul_rwkv7(
+            x, xx, *[self.fq_param(p) for p in
+                     [self.x_r, *w_coef, self.x_k, self.x_v, self.x_a, self.x_g]])]
+        xr = shifted[0]
+        xw = shifted[1] if self.cfg.dynamic_decay else None
+        xk, xv, xa, xg = shifted[-4:]
 
         r = self.receptance(xr)
         # soft-clamp to (-inf, -0.5)
-        w = self.fq_act(
-            -F.softplus(
-                -(self.fq_param(self.w0)
-                  + self.matmul_w(self.fq_act(torch.tanh(self.matmul_w(xw, self.w1))), self.w2))
-            ) - 0.5
-        )
+        if self.cfg.dynamic_decay:
+            # 参考 x070：decay 的输入相关项 tanh(xw @ w1) @ w2
+            decay_in = self.fq_param(self.w0) + self.matmul_w(
+                self.fq_act(torch.tanh(self.matmul_w(xw, self.w1))), self.w2)
+        else:
+            # 静态 decay：只由每通道常量 w0 决定，与当前 token 无关。
+            # w0 是 (1,1,C)，这一支没有 (B,T,C) 的加项去把它广播开，必须显式 expand。
+            decay_in = self.fq_param(self.w0).expand(B, T, C)
+        w = self.fq_act(-F.softplus(-decay_in) - 0.5)
         k = self.key(xk)
         v = self.value(xv)
         if self.layer_id == 0:

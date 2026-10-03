@@ -65,6 +65,8 @@ def parse_args():
     p.add_argument("--stage", choices=["pretrain", "sft"], required=True)
     p.add_argument("--ctx-len", type=int, default=512)
     p.add_argument("--wkv-chunk", type=int, default=16, help="分块 wkv7 的块长；数学等价，只影响速度与三角求解精度；必须 >= head_size")
+    p.add_argument("--dynamic-decay", type=int, default=1,
+                   help="1 = 参考 x070 的输入相关 decay；0 = decay 退回每通道静态 w0（对照实验）")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--epochs", type=int, default=1, help="跑几遍数据；1 = 完整一遍")
     p.add_argument("--steps", type=int, default=0,
@@ -189,7 +191,8 @@ def main():
     os.makedirs(CACHE_DIR, exist_ok=True)
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", CACHE_DIR)
 
-    cfg = NanoConfig(ctx_len=args.ctx_len, wkv_chunk=args.wkv_chunk)
+    cfg = NanoConfig(ctx_len=args.ctx_len, wkv_chunk=args.wkv_chunk,
+                     dynamic_decay=bool(args.dynamic_decay))
     model = NanoRWKV(cfg)
     print(f"[model] 参数量 {model.parameter_count():,}（int8 约 {model.parameter_count()/1024:.1f} KB）")
 

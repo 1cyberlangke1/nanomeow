@@ -190,3 +190,41 @@ def test_single_batch_overfits():
         last = loss.item()
     assert first is not None and first > math.log(8) * 0.5
     assert last < 0.05, f"400 步没拟合下来：{first:.3f} -> {last:.3f}"
+
+
+def test_static_decay_config_has_no_decay_lora_params():
+    """dynamic_decay=False 时 x_w / w1 / w2 必须不存在，且 param_count 与实测一致。"""
+    dynamic = NanoRWKV(NanoConfig(dynamic_decay=True))
+    static = NanoRWKV(NanoConfig(dynamic_decay=False))
+    suffix = (".x_w", ".w1", ".w2")
+    assert [k for k in dynamic.state_dict() if k.endswith(suffix)], "输入相关 decay 的参数没了"
+    assert not [k for k in static.state_dict() if k.endswith(suffix)], "静态 decay 还留着死参数"
+    for model in (dynamic, static):
+        assert model.parameter_count() == sum(p.numel() for p in model.parameters())
+    assert dynamic.parameter_count() > static.parameter_count()
+
+
+def test_static_decay_is_input_independent(monkeypatch):
+    """dynamic_decay=False 时 decay 只由 w0 决定：跨时间步逐位相同，且等于 -softplus(-w0)-0.5。"""
+    import src.model as model_mod
+
+    torch.manual_seed(0)
+    model = NanoRWKV(NanoConfig(dynamic_decay=False)).eval()
+    captured = []
+    real_run = model_mod.run_wkv7
+
+    def spy(*args, **kwargs):
+        """拦下 run_wkv7 的第 2 个位置参数（decay 张量 w），再原样转给真实现。"""
+        captured.append(args[1].detach().clone())
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(model_mod, "run_wkv7", spy)
+    idx, _ = _batch(batch=2, ctx=16, vocab=256)
+    with torch.no_grad():
+        model(idx)
+
+    assert len(captured) == TINY.n_layer, "每层应该各调一次 run_wkv7"
+    w = captured[0]
+    assert torch.equal(w, w[:, :1].expand_as(w)), "静态 decay 竟然随输入变了"
+    expect = -torch.nn.functional.softplus(-model.blocks[0].att.w0) - 0.5
+    assert torch.allclose(w[0, 0], expect[0, 0].detach(), atol=1e-6)

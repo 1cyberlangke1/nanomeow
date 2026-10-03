@@ -27,6 +27,10 @@ class NanoConfig:
     dim_lora: int = 8          # 四组低秩对的 rank；取 8 是照参考的 D/C 比例缩维，见 lora_rank
     ctx_len: int = 512
     wkv_chunk: int = 16        # 分块 wkv7 的块长；必须 >= head_size（参考的 CHUNK_LEN 是 16）
+    # 输入相关 decay：参考 x070 的 `tanh(xw @ w1) @ w2` 那一支。True = 原样移植；
+    # False = decay 退回每通道静态 w0，并且**不注册** x_w / w1 / w2——它们在没有
+    # 这一支时进不了任何计算，留着就是梯度恒 0 的死参数。
+    dynamic_decay: bool = True
 
     def __post_init__(self):
         # 参考 Tmix 用 x.view(B, T, n_head, -1) 切通道，所以 dim_att 必须等于 n_embd
@@ -58,15 +62,19 @@ class NanoConfig:
         """按模型结构算参数量，用于和实测值对账。
 
         单层 = 4*C*C（r/k/v/output）
-             + 11*C（x_r..x_g + Cmix.x_k + ln1/ln2 的 weight+bias）
+             + 11*C（x_r..x_g + Cmix.x_k + ln1/ln2 的 weight+bias；
+                     dynamic_decay=False 时没有 x_w，是 10*C）
              + 8*C（w0,a0,v0,k_k,k_a,r_k + ln_x 的 weight+bias）
-             + 2*C*4*D（四组低秩对，rank 都是 dim_lora）
+             + 2*C*4*D（四组低秩对，rank 都是 dim_lora；
+                        dynamic_decay=False 时 decay 那一组不存在，是三组）
              + 2*C*dim_ffn（Cmix key/value）
         全局 = 2*C（ln_out）+ V*C（emb）+ V*C（head，独立不共享）+ 2*C（第 0 层的 ln0）
         """
         c, f, v, l = self.n_embd, self.dim_ffn, self.vocab_size, self.n_layer
-        per_layer = (4 * c * c + 11 * c + 8 * c
-                     + 2 * c * 4 * self.dim_lora
+        n_mix = 11 if self.dynamic_decay else 10
+        n_lora = 4 if self.dynamic_decay else 3
+        per_layer = (4 * c * c + n_mix * c + 8 * c
+                     + 2 * c * n_lora * self.dim_lora
                      + 2 * c * f)
         return l * per_layer + 2 * c + v * c + v * c + 2 * c
 

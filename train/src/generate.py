@@ -44,6 +44,25 @@ def stream_decode(byte_iter, max_bytes=None, stop_byte=ETX_ID):
     return text, False
 
 
+def _apply_repetition_penalty(logits, history, penalty, window=0):
+    """对「已经生成过」的字节施加重复惩罚。
+
+    输入：最后一位 logits (V,)、已生成字节列表、惩罚系数（<= 1 表示关闭）、窗口大小
+          （0 = 用全部历史）。
+    输出：修正后的 logits（新张量，不改原值）。
+    预期行为：CTRL 式惩罚——历史里出现过的 token，正 logit 除以 penalty、负 logit 乘以
+              penalty，于是它们更难被再选中；历史为空或 penalty <= 1 时原样返回。
+    """
+    if penalty <= 1.0 or not history:
+        return logits
+    seen = history if window <= 0 else history[-window:]
+    idx = torch.tensor(sorted(set(seen)), dtype=torch.long, device=logits.device)
+    out = logits.clone()
+    vals = out.index_select(0, idx)
+    out.index_copy_(0, idx, torch.where(vals > 0, vals / penalty, vals * penalty))
+    return out
+
+
 def _sample(logits, temperature, top_k):
     """输入：最后一位的 logits (V,)、温度、top_k；输出：一个字节 id。
 
@@ -60,7 +79,8 @@ def _sample(logits, temperature, top_k):
 
 
 @torch.no_grad()
-def generate(model, prompt, max_new_tokens=256, temperature=0.0, top_k=0):
+def generate(model, prompt, max_new_tokens=256, temperature=0.0, top_k=0,
+             repetition_penalty=1.0, penalty_window=0):
     """输入：模型、prompt 字符串、生成上限、采样参数。
 
     输出：生成出来的文本（不含停止字节 `<ETX>`）。
@@ -82,8 +102,12 @@ def generate(model, prompt, max_new_tokens=256, temperature=0.0, top_k=0):
         if logits is None:  # 空 prompt：用一个占位字节起头
             x = torch.zeros(1, 1, dtype=torch.long, device=device)
             logits, state = model(x, state)
+        generated = []
         for _ in range(max_new_tokens):
-            nxt = _sample(logits[0, -1], temperature, top_k)
+            lg = _apply_repetition_penalty(
+                logits[0, -1], generated, repetition_penalty, penalty_window)
+            nxt = _sample(lg, temperature, top_k)
+            generated.append(nxt)
             yield nxt
             x = torch.tensor([[nxt]], dtype=torch.long, device=device)
             logits, state = model(x, state)
@@ -110,13 +134,18 @@ def main():
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-k", type=int, default=0)
+    p.add_argument("--repetition-penalty", type=float, default=1.0,
+                   help="CTRL 式重复惩罚，1.0 = 关闭")
+    p.add_argument("--penalty-window", type=int, default=0,
+                   help="只看最近多少个已生成字节，0 = 全部历史")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
     model = load_model(args.ckpt, args.device)
     prompt = build_prompt(args.prompt)
     print(f"[prompt] {prompt!r}")
-    text = generate(model, prompt, args.max_new_tokens, args.temperature, args.top_k)
+    text = generate(model, prompt, args.max_new_tokens, args.temperature, args.top_k,
+                    args.repetition_penalty, args.penalty_window)
     print(f"[reply] {text!r}")
     print("[reply/raw]")
     print(text)

@@ -3,7 +3,12 @@
 import torch
 
 from src.config import NanoConfig
-from src.generate import build_prompt, generate, stream_decode
+from src.generate import (
+    _apply_repetition_penalty,
+    build_prompt,
+    generate,
+    stream_decode,
+)
 from src.model import NanoRWKV
 from src.tokenizer import ETX_ID, UTF8StreamDecoder, encode
 
@@ -104,3 +109,34 @@ def test_generate_chunks_long_prompt():
     model = NanoRWKV(NanoConfig(ctx_len=16))
     out = generate(model, build_prompt("这是一段明显超过十六个字节的用户输入"), max_new_tokens=8)
     out.encode("utf-8").decode("utf-8", errors="strict")
+
+def test_repetition_penalty_off_is_noop():
+    """penalty <= 1 或历史为空时，logits 必须原样返回。"""
+    logits = torch.tensor([1.0, -2.0, 3.0])
+    assert torch.equal(_apply_repetition_penalty(logits, [], 1.5), logits)
+    assert torch.equal(_apply_repetition_penalty(logits, [0, 1], 1.0), logits)
+
+
+def test_repetition_penalty_suppresses_seen_bytes():
+    """出现过的字节：正 logit 被除、负 logit 被乘，没出现过的字节不动。"""
+    logits = torch.tensor([2.0, -4.0, 5.0])
+    out = _apply_repetition_penalty(logits, [0, 1], 2.0)
+    assert out[0].item() == 1.0
+    assert out[1].item() == -8.0
+    assert out[2].item() == 5.0
+
+
+def test_repetition_penalty_window_limits_history():
+    """窗口只算最近若干个字节，窗口外的历史不参与惩罚。"""
+    logits = torch.tensor([2.0, 3.0])
+    out = _apply_repetition_penalty(logits, [0, 1], 2.0, window=1)
+    assert out[0].item() == 2.0
+    assert out[1].item() == 1.5
+
+
+def test_repetition_penalty_can_flip_argmax():
+    """惩罚够大时，已出现过的字节必须被竞争者反超——这就是压住复读的机制。"""
+    logits = torch.tensor([2.0, 1.5])
+    assert int(torch.argmax(logits).item()) == 0
+    out = _apply_repetition_penalty(logits, [0], 2.0)
+    assert int(torch.argmax(out).item()) == 1

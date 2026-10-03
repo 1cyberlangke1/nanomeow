@@ -107,6 +107,25 @@ def test_qat_gradients_reach_every_parameter():
     assert dead == [], f"这些参数在 QAT 下梯度恒为零：{dead}"
 
 
+def test_qat_static_decay_gradients_reach_every_parameter():
+    """静态 decay（dynamic_decay=False）下同样不能有死参数：x_w/w1/w2 已不存在，其余都要动。"""
+    torch.manual_seed(0)
+    model = prepare_qat(NanoRWKV(NanoConfig(dynamic_decay=False)))
+    model.train()
+    idx, y = _batch()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    for _ in range(20):
+        opt.zero_grad(set_to_none=True)
+        logits, _ = model(idx)
+        _loss(logits, y).backward()
+        opt.step()
+    dead = [n for n, p in model.named_parameters()
+            if n not in DEAD_BY_REFERENCE_BRANCH and p.grad is not None
+            and float(p.grad.norm()) == 0.0]
+    assert dead == [], f"静态 decay 下有梯度恒为零的参数：{dead}"
+    assert not [n for n in model.state_dict() if n.endswith((".x_w", ".w1", ".w2"))]
+
+
 def test_fake_quant_ste_passes_gradient():
     """STE：量化点在界内时梯度必须原样传回（不是 0）。"""
     q = IntxFakeQuantizer(per_tensor_int8())
