@@ -135,9 +135,22 @@ def export(model, out_path):
         fh.write("/* 自动生成，请勿手改：train/scripts/export_int8.py */\n")
         fh.write("#ifndef NANOMEOW_WEIGHTS_H\n#define NANOMEOW_WEIGHTS_H\n")
         fh.write("#include <stdint.h>\n\n")
-        fh.write("/* 每个张量：int8 码 + 每行 int32 乘子 + int8 移位，值 = 码 * (乘子 * 2^移位) */\n")
+        fh.write("/* 每个张量：int8 码 + 每行 int32 乘子 + int8 移位，值 = 码 * (乘子 * 2^移位)；符号前缀 nmw_ = nano-meow weights */\n")
+        fh.write("/*\n")
+        fh.write(" * 本文件导出的权重（名字 = 训练侧参数名；字节数 = int8 码 / scale 表）：\n")
         for name, codes, mul, shift, per_row in exported:
-            sym = "nm_" + name.replace(".", "_")
+            if per_row:
+                kind = "per-row %d x %d" % (mul.numel(), codes.numel() // mul.numel())
+            else:
+                kind = "per-tensor %d" % codes.numel()
+            fh.write(" *   %-32s %6d B / %5d B  (%s)\n"
+                     % (name, codes.numel(), mul.numel() * 5, kind))
+        fh.write(" * 合计：码 %d B（%.1f KiB）+ scale 表 %d B（%.1f KiB）= %d B（%.1f KiB）\n"
+                 % (n_param, n_param / 1024.0, n_scale * 5, n_scale * 5 / 1024.0,
+                    n_param + n_scale * 5, (n_param + n_scale * 5) / 1024.0))
+        fh.write(" */\n")
+        for name, codes, mul, shift, per_row in exported:
+            sym = "nmw_" + name.replace(".", "_")
             flat = ",".join(str(v) for v in codes.reshape(-1).tolist())
             fh.write("static const int8_t %s[] = {%s};\n" % (sym, flat))
             if per_row:
