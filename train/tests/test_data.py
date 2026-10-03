@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from src.data import PretrainDataset, SFTDataset, build_pretrain_stream, build_sft_arrays
-from src.tokenizer import PAD_ID
+from src.tokenizer import ETX_ID, PAD_ID
 
 
 def _write_jsonl(path, texts):
@@ -16,8 +16,8 @@ def _write_jsonl(path, texts):
             f.write(json.dumps({"text": t}, ensure_ascii=False) + "\n")
 
 
-def test_build_sft_arrays_masks_last_position(tmp_path):
-    """样本最后一个位置的 target 是补位 PAD，必须不参与 loss。"""
+def test_build_sft_arrays_masks_prompt_and_last_position(tmp_path):
+    """模板前缀（user:<内容>\\nbot:）与末尾 <ETX> 都不参与 loss，只有回答段参与。"""
     texts = ["user:你好\nbot:喵", "user:ab\nbot:cd"]
     src = tmp_path / "s.jsonl"
     _write_jsonl(src, texts)
@@ -25,19 +25,26 @@ def test_build_sft_arrays_masks_last_position(tmp_path):
     meta = build_sft_arrays(str(src), str(out), ctx_len=32)
 
     assert meta["kept"] == 2 and meta["dropped_over_ctx"] == 0
+    assert meta["no_template"] == 0
     x = np.load(out / "sft_x.npy")
     y = np.load(out / "sft_y.npy")
     mask = np.load(out / "sft_mask.npy")
 
     for i, t in enumerate(texts):
-        n = len(t.encode("utf-8"))
-        # 有效位恰好是「除最后一位以外」的全部位置
-        assert int(mask[i].sum()) == n - 1
+        # 打包时末尾补一个 <ETX>，所以落盘长度是样本字节数 + 1
+        raw = t.encode("utf-8")
+        data = np.frombuffer((t + chr(ETX_ID)).encode("utf-8"), dtype=np.uint8)
+        n = len(data)
+        # 回答段从 `\nbot:` 之后开始；它之前（含 `bot:` 本身）整段不参与 loss
+        start = raw.index(b"\nbot:") + len(b"\nbot:")
+        assert n == len(raw) + 1 and int(data[-1]) == ETX_ID
+        assert mask[i, :start].sum() == 0
+        assert int(mask[i, start:n - 1].sum()) == n - 1 - start
         assert mask[i, n - 1] == 0
-        # 有效位上 y 就是下一个字节
-        data = np.frombuffer(t.encode("utf-8"), dtype=np.uint8)
+        # 有效位上 y 就是下一个字节；倒数第二位学到的正是「这里该吐 <ETX>」
         assert np.array_equal(x[i, :n], data)
         assert np.array_equal(y[i, :n - 1], data[1:])
+        assert int(y[i, n - 2]) == ETX_ID
         # 补位区不能有 mask
         assert mask[i, n:].sum() == 0
 
@@ -63,14 +70,16 @@ def test_sft_dataset_shapes(tmp_path):
 
 
 def test_pretrain_stream_and_windows(tmp_path):
-    """字节流按 jsonl 顺序拼接；窗口的 y 是 x 右移一位。"""
+    """字节流按 jsonl 顺序拼接、每篇文档后补一个 <ETX>；窗口的 y 是 x 右移一位。"""
     src = tmp_path / "p.jsonl"
     _write_jsonl(src, ["abc", "de"])
     bin_path = tmp_path / "p.bin"
     total = build_pretrain_stream(str(src), str(bin_path))
-    assert total == 5
+    # 每篇文档后补一个 <ETX>：3 + 1 + 2 + 1
+    assert total == 7
+    assert bin_path.read_bytes() == b"abc\x03de\x03"
     # 幂等：已存在时直接返回大小，不重写
-    assert build_pretrain_stream(str(src), str(bin_path)) == 5
+    assert build_pretrain_stream(str(src), str(bin_path)) == 7
 
     ds = PretrainDataset(str(bin_path), ctx_len=2)
     x, y = ds[0]

@@ -48,8 +48,8 @@ b̂/k̂ 里的 e^{-LW} 不是瓶颈：反向精度与 float64 逐 token oracle �
 的相对误差都在 1e-7。
 
 块长上界因此只剩**精度**意义：三角求解的误差 ~ cond(I-ab)·eps，而 cond 随块长
-组合式增长。参考实现的 CUDA kernel 用 CHUNK_LEN = 16，这里对齐它 —— CHUNK = 16，
-NanoConfig 把上界钉在 32 作保守余量。
+组合式增长。参考实现的 CUDA kernel 用 CHUNK_LEN = 16，这里对齐它：CHUNK = 16，
+NanoConfig.wkv_chunk 也取 16。
 
 全程真 fp32（`autocast(enabled=False)`）：块内解 (I - ab) SA = rhs 是三角求解，
 bf16 只有 8 位尾数，解病态三角系统时误差会被放大。模型其余部分照常走 bf16，
@@ -205,7 +205,10 @@ def _wkv7_chunked_fp32(w, q, k, v, a, b, state_in, chunk, qat=None):
     y = y.permute(0, 2, 3, 1, 4).reshape(bsz, t_pad, n_head, dim)
     if pad:
         y = y[:, :t_len]
-    return y.to(out_dtype), state
+    # 必须 contiguous：permute 后 reshape 在 n_head == 1 时不会复制、直接返回非连续
+    # 视图（H > 1 时才需要复制），pad 切片同样产生非连续视图。调用方按 (B,T,C) 连续
+    # 布局用 .view 就会报 view size is not compatible。
+    return y.contiguous().to(out_dtype), state
 
 
 def run_wkv7(q, w, k, v, a, b, state_in=None, head_size=8, chunk=CHUNK, qat=None):

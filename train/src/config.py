@@ -1,6 +1,6 @@
 """nanomeow 的模型与训练超参。
 
-基线配置：V=256 / L=2 / C=32 / head_size=8 / n_head=4 /
+基线配置：V=256 / L=3 / C=32 / head_size=8 / n_head=4 /
 dim_ffn=64；低秩 rank 见 `dim_lora`。
 """
 
@@ -16,14 +16,17 @@ class NanoConfig:
     """
 
     vocab_size: int = 256      # 字节 tokenizer：0..255
-    n_layer: int = 2
+    n_layer: int = 3
     n_embd: int = 32
     dim_att: int = 32          # 参考的 args.dim_att；参考里必须等于 n_embd
+    # 每头 state 是 N×N 矩阵，一个头最多存 N 个独立的 rank-1 关联；总秩是
+    # n_head×N，N=8（4 头）与 N=32（1 头）都是 32，缩 N 不损失关联容量，
+    # 但只有 N=8 才走得上 CUDA kernel 快路径（对齐参考的 head_size / CHUNK_LEN）。
     head_size: int = 8
     dim_ffn: int = 64
     dim_lora: int = 8          # 四组低秩对的 rank；取 8 是照参考的 D/C 比例缩维，见 lora_rank
     ctx_len: int = 512
-    wkv_chunk: int = 16        # 分块 wkv7 的块长，对齐参考实现的 CHUNK_LEN
+    wkv_chunk: int = 16        # 分块 wkv7 的块长；必须 >= head_size（参考的 CHUNK_LEN 是 16）
 
     def __post_init__(self):
         # 参考 Tmix 用 x.view(B, T, n_head, -1) 切通道，所以 dim_att 必须等于 n_embd

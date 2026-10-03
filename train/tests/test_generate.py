@@ -1,11 +1,11 @@
-"""生成路径测试：增量 UTF-8 解码、停止标记截断、端到端不乱码。"""
+"""生成路径测试：增量 UTF-8 解码、<ETX> 截断、端到端不乱码。"""
 
 import torch
 
 from src.config import NanoConfig
 from src.generate import build_prompt, generate, stream_decode
 from src.model import NanoRWKV
-from src.tokenizer import UTF8StreamDecoder, encode
+from src.tokenizer import ETX_ID, UTF8StreamDecoder, encode
 
 
 class _StubModel(torch.nn.Module):
@@ -54,28 +54,28 @@ def test_stream_decode_holds_partial_utf8():
 
 def test_stream_decode_drops_invalid_bytes():
     """非法字节必须被丢掉，绝不能变成 U+FFFD。"""
-    text, _ = stream_decode(iter([0xFF, 0xFE, ord("a"), 0xFF]), stop_marker="\u0000")
+    text, _ = stream_decode(iter([0xFF, 0xFE, ord("a"), 0xFF]))
     assert text == "a"
     assert "\ufffd" not in text
 
 
-def test_stream_decode_truncates_at_marker():
-    """命中停止标记后，标记本身与后面的字节都要丢。"""
-    text, hit = stream_decode(iter(encode("喵喵user:尾巴")), stop_marker="user:")
+def test_stream_decode_truncates_at_etx():
+    """命中 <ETX> 后，它本身与后面的字节都要丢。"""
+    text, hit = stream_decode(iter(encode("喵喵") + [ETX_ID] + encode("尾巴")))
     assert hit is True
     assert text == "喵喵"
 
 
 def test_stream_decode_respects_max_bytes():
     """字节上限生效，且截断处不吐半截字符。"""
-    text, hit = stream_decode(iter(encode("喵喵")), stop_marker="\u0000", max_bytes=4)
+    text, hit = stream_decode(iter(encode("喵喵")), max_bytes=4)
     assert hit is False
     assert text == "喵"
 
 
-def test_generate_stops_at_user_marker():
-    """模型吐到 user: 必须立刻停，返回标记之前的完整字符。"""
-    stub = _StubModel(encode("喵喵user:后面还有一堆"))
+def test_generate_stops_at_etx():
+    """模型吐到 <ETX> 必须立刻停，返回它之前的完整字符。"""
+    stub = _StubModel(encode("喵喵") + [ETX_ID] + encode("后面还有一堆"))
     out = generate(stub, build_prompt("在吗"), max_new_tokens=64)
     assert out == "喵喵"
 

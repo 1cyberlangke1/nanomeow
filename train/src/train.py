@@ -55,7 +55,8 @@ class L2Wrap(torch.autograd.Function):
         maxx, ids = torch.max(logits, -1, keepdim=True)
         gy = torch.zeros_like(logits)
         gy.scatter_(-1, ids, (maxx * (1e-4 / (logits.shape[0] * logits.shape[1]))).to(logits.dtype))
-        return grad_output, grad_output * gy
+        # 与参考逐字一致：返回裸 gy（等价于假定 grad_output == 1，标量 loss 直接 backward 时成立）
+        return grad_output, gy
 
 
 def parse_args():
@@ -63,7 +64,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", choices=["pretrain", "sft"], required=True)
     p.add_argument("--ctx-len", type=int, default=512)
-    p.add_argument("--wkv-chunk", type=int, default=16, help="分块 wkv7 的块长；数学等价，只影响速度与三角求解精度")
+    p.add_argument("--wkv-chunk", type=int, default=16, help="分块 wkv7 的块长；数学等价，只影响速度与三角求解精度；必须 >= head_size")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--epochs", type=int, default=1, help="跑几遍数据；1 = 完整一遍")
     p.add_argument("--steps", type=int, default=0,

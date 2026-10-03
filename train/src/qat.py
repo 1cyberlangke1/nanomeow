@@ -14,8 +14,7 @@ int4 / range learning / 静态 qparam）。
 | `_Round` / `_ClampSTE` | 同上 |
 | `_get_and_check_qmin_qmax` | 同上 |
 | `_get_reduction_params` | 同上 |
-| `_quantize_affine_no_zero_point_no_dtype_cast` | 同上 |
-| `_dequantize_affine_no_zero_point_no_dtype_check` | 同上 |
+| `_fake_quantize_no_zero_point_ste` | `_quantize_affine_no_zero_point_no_dtype_cast` 与 `_dequantize_affine_no_zero_point_no_dtype_check` 两步的融合：前向逐位相同，反向用 detach 表达 STE（理由见函数注释） |
 | `_choose_qparams_affine`（留 SYMMETRIC / SYMMETRIC_NO_CLIPPING_ERR） | 同上 |
 | `_do_fake_quantize_affine` / `_fake_quantize_affine` | 同上 |
 | `_fake_quantize_per_channel_group` | `torchao/quantization/qat/utils.py` |
@@ -29,6 +28,7 @@ int4 / range learning / 静态 qparam）。
 - 权重 **int8**，per-channel（per-row）对称、无 zero-point，范围 `[-128, 127]`，映射用 `SYMMETRIC_NO_CLIPPING_ERR`（两端精确可表示，不饱和）。
 - 激活 **int8**，per-tensor 动态（运行时求 max -> scale）。
 - 累加 int32；对称、无 zero-point；不做分组。
+- quantize 与 dequantize 融合成一个 autograd 算子：前向与 torchao 的两步实现逐位相同，反向用解析式 `gy * 在界内`，避免拆两步时 `(1 / scale) * scale` 在 bf16 的次正规区间下溢成 0。
 """
 
 import enum
@@ -217,20 +217,31 @@ def _get_reduction_params(block_size, input_size):
     return shape_for_reduction, reduction_dims
 
 
-def _quantize_affine_no_zero_point_no_dtype_cast(
+def _fake_quantize_no_zero_point_ste(
     input: torch.Tensor,
     block_size: Tuple[int, ...],
     scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor],
-    quant_min: Optional[Union[int, float]] = None,
-    quant_max: Optional[Union[int, float]] = None,
+    quant_min: Union[int, float],
+    quant_max: Union[int, float],
 ) -> torch.Tensor:
-    """torchao 原样移植：无 zero-point 的仿射量化（不做 dtype 转换）。
+    """输入：float 张量、block_size、scale、量化范围；输出：假量化后的张量。
 
-    输入：float 张量、block_size、scale、zero_point（本口径下为 None）。
-    输出：取整并夹取后的 float 张量，值域是 scale 的整数倍。
-    预期行为：q = clamp(round(x / scale), quant_min, quant_max)；取整走 _Round 的 STE、
-              夹取走 _ClampSTE，两者都不会在 torch.compile 图里被折叠掉。
+    预期行为：前向 = clamp(round(x / scale), quant_min, quant_max) * scale，与 torchao 的
+              两步实现（_quantize_affine_no_zero_point_no_dtype_cast +
+              _dequantize_affine_no_zero_point_no_dtype_check）逐位相同；反向 = 恒等（STE）。
+
+    反向用 quant.detach() + (input - input.detach()) 表达，不用自定义 autograd.Function：
+
+    - input - input.detach() 前向恒为 0（同值相减），所以整体前向就是 quant、逐位不变；
+      反向只走这一项、恒等，不经过 (1 / scale) * scale 的浮点乘除，scale 极小（全零输入
+      被 clamp 到 smallest_normal）时也不会把中间梯度刷成次正规零 —— bf16 下这正是
+      decay 支路梯度全 0 的原因。
+    - 自定义 autograd.Function 的 forward 里出现 .to(x.dtype) 时，torch.compile 的追踪会
+      把 STE 反向整个丢掉：前向不变、梯度张量存在但精确为 0（实测 per-tensor / per-row
+      都是 grad=32 -> 0，去掉那个 cast 就恢复）。纯算子写法没有这个问题。
+
+    不做「取整值越界则反向给 0」的门控：本项目的 scale 是动态的（每步按当前张量重算），
+    两端极值恰好映射到 quant_min / quant_max，永远落在界内。
     """
     assert input.dtype in [
         torch.float32,
@@ -240,64 +251,14 @@ def _quantize_affine_no_zero_point_no_dtype_cast(
     assert len(block_size) == input.dim(), (
         f"Got input dim:{input.dim()}, block_size: {block_size}"
     )
-    shape_for_reduction, reduction_dims = _get_reduction_params(
-        block_size, input.size()
-    )
-    original_shape = input.shape
-    input = input.view(shape_for_reduction)
-    shape_after_reduction = shape_for_reduction
+    shape_for_reduction, reduction_dims = _get_reduction_params(block_size, input.size())
+    shape_after_reduction = list(shape_for_reduction)
     for i in reduction_dims:
         shape_after_reduction[i] = 1
-    scale = scale.view(shape_after_reduction)
-
-    if zero_point is not None and zero_point.numel() > 0:
-        zero_point = zero_point.view(shape_after_reduction)
-    else:
-        # in some cases zero_point being a non-value shows as a tensor
-        # with numel=0 which we handle by unifying the two
-        zero_point = None
-
-    quant = _ClampSTE.apply(_Round.apply(input * (1.0 / scale)), quant_min, quant_max)
-    quant = quant.view(original_shape)
-
-    return quant
-
-
-def _dequantize_affine_no_zero_point_no_dtype_check(
-    input: torch.Tensor,
-    block_size: List[int],
-    scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor],
-    quant_min: Union[int, float],
-    quant_max: Union[int, float],
-    output_dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """torchao 原样移植：无 zero-point 的反量化（不校验 dtype）。
-
-    输入：量化后的张量、block_size、scale、zero_point（必须为 None）。
-    输出：反量化回 output_dtype 的张量。
-    预期行为：dq = q * scale（无 zero-point 相减）；形状按 block_size 广播回原形状。
-    """
-    assert len(block_size) == input.dim(), (
-        f"Got input dim:{input.dim()}, block_size: {block_size}"
-    )
-    shape_for_reduction, reduction_dims = _get_reduction_params(
-        block_size, input.size()
-    )
-    original_shape = input.shape
-    input = input.view(shape_for_reduction)
-    shape_after_reduction = shape_for_reduction
-    for i in reduction_dims:
-        shape_after_reduction[i] = 1
-    scale = scale.view(shape_after_reduction)
-
-    assert zero_point is None, (
-        "zero_point should be None for _dequantize_affine_no_zero_point"
-    )
-    dequant = input.to(output_dtype)
-    dequant = dequant * scale
-
-    return dequant.view(original_shape).to(output_dtype)
+    s = scale.view(shape_after_reduction)
+    rounded = torch.round(input * (1.0 / s))
+    quant = (torch.clamp(rounded, quant_min, quant_max).to(input.dtype) * s).to(input.dtype)
+    return quant.detach() + (input - input.detach())
 
 
 @torch.no_grad()
@@ -426,17 +387,19 @@ def _do_fake_quantize_affine(
     """torchao 移植（只留 INT / NONE 两个域）：量化 + 反量化。
 
     输入：float 张量、block_size、scale、zero_point、目标 dtype、范围、zero-point 域。
-    输出：(取整后的整数张量, 反量化回输入 dtype 的张量)。
-    预期行为：NONE 域走 no_zero_point 两个算子，并要求 zero_point 为 None。
+    输出：(取整后的整数张量, 反量化回输入 dtype 的张量)；NONE 域两步合一，第一个是 None。
+    预期行为：NONE 域走融合 STE（见 _fake_quantize_no_zero_point_ste），并要求 zero_point 为 None。
     """
     input_dtype = input.dtype
     quant_min, quant_max = _get_and_check_qmin_qmax(quant_dtype, quant_min, quant_max)
+    if zero_point_domain == ZeroPointDomain.NONE:
+        # NONE 域：前向逐位等于 torchao 的两步实现，反向用解析式。
+        assert zero_point is None, "NONE 域的 zero_point 必须是 None"
+        return None, _fake_quantize_no_zero_point_ste(
+            input, block_size, scale, quant_min, quant_max)
     if zero_point_domain == ZeroPointDomain.INT:
         _quantize_affine = _quantize_affine_no_dtype_cast
         _dequantize_affine = _dequantize_affine_no_dtype_check
-    elif zero_point_domain == ZeroPointDomain.NONE:
-        _quantize_affine = _quantize_affine_no_zero_point_no_dtype_cast
-        _dequantize_affine = _dequantize_affine_no_zero_point_no_dtype_check
     else:
         raise ValueError(f"Unrecognized zero point domain: {zero_point_domain}")
     q = _quantize_affine(
@@ -473,7 +436,7 @@ def _fake_quantize_affine(
 
     输入：同 _do_fake_quantize_affine。
     输出：反量化回输入 dtype 的张量（前向等价于 quantize + dequantize，不做 dtype 转换）。
-    预期行为：反向由 _Round / _ClampSTE 的 STE 给出。
+    预期行为：反向由 _fake_quantize_no_zero_point_ste 的 detach STE 给出。
     """
     (_, fq) = _do_fake_quantize_affine(
         input,

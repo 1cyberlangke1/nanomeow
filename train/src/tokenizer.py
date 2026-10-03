@@ -3,6 +3,10 @@
 不做 BPE、不训分词器。V = 256，任意文本都能编码，不存在 OOV，
 MCU 端零分词逻辑——串口收到的字节就是 token。
 
+结构信息**不扩词表**：序列结束用 C0 控制字节 `<ETX>`（0x03）表示，
+token ID 恒在 0..255 内，不存在 256 号 ID。清洗阶段已把预留的 C0 字节剔除，
+所以 0x03 只可能是结构标记、不会和正文混淆。
+
 生成时模型一次只吐一个字节，单个字节可能只是某个 UTF-8 字符的前半截，
 直接解码会得到 U+FFFD 乱码。`UTF8StreamDecoder` 负责按字符边界吐字：
 完整字符立刻输出，半截序列留在缓冲里等后续字节，非法字节直接丢掉。
@@ -12,7 +16,8 @@ from typing import Iterable, List
 
 VOCAB_SIZE = 256
 PAD_ID = 0                 # SFT 批次补齐用；训练时按位置屏蔽，不参与 loss
-STOP_MARKER = "user:"      # 生成到下一个 user: 就停
+ETX_ID = 0x03              # <ETX>（End of Text）：序列结束标记
+ETX = chr(ETX_ID)
 
 
 def encode(text: str) -> List[int]:
@@ -83,8 +88,8 @@ class UTF8StreamDecoder:
 
 
 def find_stop(text: str) -> int:
-    """输入：已解码文本；输出：`user:` 出现的位置，没有则返回 -1。
+    """输入：已解码文本；输出：`<ETX>`（0x03）出现的位置，没有则返回 -1。
 
     只在完整字符边界上查找，所以不会把半截 UTF-8 序列误判成停止标记。
     """
-    return text.find(STOP_MARKER)
+    return text.find(ETX)

@@ -11,7 +11,7 @@ TINY = NanoConfig()
 
 # 模型自带的插桩点个数：每层 Tmix 4 个（act/param/w/wkv）+ CMix 2 个 + Block 2 个，
 # 两层共 16 个，再加顶层的 fq_act / fq_param。
-N_HOOKS = 18
+N_HOOKS = 8 * TINY.n_layer + 2
 
 
 def _batch(batch=2, ctx=16, vocab=256, seed=0):
@@ -112,9 +112,32 @@ def test_fake_quant_ste_passes_gradient():
     q = IntxFakeQuantizer(per_tensor_int8())
     x = torch.randn(16, requires_grad=True)
     q(x).sum().backward()
-    # 端点精确可表示、没有元素被 clamp；反量化乘回 scale 时 (1/scale)*scale 在 fp 下
-    # 不等于 1，梯度带 1 个 ulp 的误差
-    assert torch.allclose(x.grad, torch.ones_like(x.grad), atol=1e-6)
+    # 端点精确可表示、没有元素被 clamp；反向是解析式，所以恒等于 1，不带 (1/scale)*scale 的 ulp 误差
+    assert torch.equal(x.grad, torch.ones_like(x.grad))
+
+
+def test_fake_quant_ste_survives_all_zero_tensor_in_bf16():
+    """全零张量（scale 退化成 smallest_normal）下 STE 必须照样传梯度，哪怕 gy 远小于 7.8e-3。
+
+    回归点：把 quantize / dequantize 拆成两步时，中间梯度 `gy * scale` 会掉进次正规区间
+    被刷成 0（bf16 的下限是 9.2e-41，对应 gy < 7.8e-3），再乘回 1 / scale 仍是 0。
+    decay 的低秩对是零初始化，第一步就产生全零张量，于是 x_w / w1 / w2 永远拿不到梯度。
+    """
+    q = IntxFakeQuantizer(per_tensor_int8())
+    x = torch.zeros(4, 8, dtype=torch.bfloat16, requires_grad=True)
+    (q(x) * 1e-8).sum().backward()
+    assert torch.equal(q.scale, torch.tensor(torch.finfo(torch.bfloat16).smallest_normal)), (
+        f"这组输入没有触发退化 scale：{q.scale}")
+    assert torch.allclose(x.grad, torch.full_like(x.grad, 1e-8)), (
+        f"全零张量下梯度被吃掉了：{x.grad.flatten()[:4]}")
+
+
+def test_per_row_fake_quant_ste_survives_all_zero_weight():
+    """per-row 权重全零（scale 同样退化成 smallest_normal）时也必须传梯度。"""
+    q = IntxFakeQuantizer(per_row_int8())
+    w = torch.zeros(32, 8, dtype=torch.bfloat16, requires_grad=True)
+    (q(w.transpose(0, 1)) * 1e-8).sum().backward()
+    assert (w.grad != 0).all(), "全零权重的梯度被吃掉了"
 
 
 def test_per_row_quant_matches_manual():
