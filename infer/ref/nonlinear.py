@@ -197,6 +197,15 @@ def qt_tanh(x):
     return from_fixed([tanh_q(v) for v in to_fixed(x)])
 
 
-def qt_softplus(x):
-    """输入：QTensor；输出：QTensor。预期行为：逐元素 softplus 后再 per-tensor 量化。"""
-    return from_fixed([softplus_q(v) for v in to_fixed(x)])
+def qt_softplus(x, quantize=True):
+    """输入：QTensor、是否量化；输出：QTensor。
+
+    预期行为：逐元素 softplus。quantize=True 走 per-tensor 动态量化；
+              **decay 那条路必须传 False**：训练侧写的是 `fq_act(-softplus(-decay_in) - 0.5)`，
+              量化点在整个表达式之后，softplus 自己不能再量化一次——多量化一次会引入
+              0.027 量级的偏差，把 decay 的 int8 码顶过边界，跨 token 累积后 state 跑飞。
+    """
+    vals = [softplus_q(v) for v in to_fixed(x)]
+    if quantize:
+        return from_fixed(vals)
+    return QTensor(vals, scale_from_frac(FRAC_BITS))

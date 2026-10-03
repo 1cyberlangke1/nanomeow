@@ -68,13 +68,17 @@ def quantize(codes, scale):
     return QTensor(q, s)
 
 
-def _quantize_rows(accs, scales):
-    """输入：每行一个整数码、每行一个 scale（= s_w[i] * s_x）；输出：统一 scale 的 QTensor。
+def _quantize_rows(accs, scales, quantize=True):
+    """输入：每行一个整数码、每行一个 scale（= s_w[i] * s_x）、是否量化；输出：统一 scale 的 QTensor。
 
-    预期行为：复刻训练侧对 Linear 输出的 per-tensor 动态假量化（SYMMETRIC_NO_CLIPPING_ERR）。
-              每行实值是 acc_i * scale_i，所以先把各行拉到公共指数（取最小指数）上比较，
-              再取步长并量化；步长写成有理数 num / den，全程整数。
-              注意 scale_i 已经含了输入的 s_x，这里**不能**再乘一次。
+    预期行为：每行实值是 acc_i * scale_i，所以先把各行拉到公共指数（取最小指数）上得到
+              `vals`（单位是 2^e_ref），这是**未量化**的原始结果；quantize=True 时再按
+              per-tensor 动态口径（SYMMETRIC_NO_CLIPPING_ERR）取步长 num / den 量化成 int8，
+              全程整数。注意 scale_i 已经含了输入的 s_x，这里**不能**再乘一次。
+
+              quantize=False 的用途：训练侧 `FakeQuantizedLinear` 只量化输入与权重、
+              **不量化输出**，输出要等到下一个 `fq_act` 点才量化（k / v / output / ffn.value
+              这几路就是这样），所以这些位置必须保留原始结果。
     """
     e_ref = min(e for _, e in scales)
     vals = []
@@ -84,6 +88,8 @@ def _quantize_rows(accs, scales):
     num = max(mx * (QMAX + 1), -mn * QMAX)
     den = QMAX * (QMAX + 1)
     base = normalize(1, e_ref)
+    if not quantize:
+        return QTensor(vals, base)
     if num == 0:
         return QTensor([0] * len(vals), base)
     out_scale = div_int(mul_int(base, num), den)
@@ -94,14 +100,16 @@ def _quantize_rows(accs, scales):
     return QTensor(out, out_scale)
 
 
-def linear(x, mat):
-    """输入：QTensor x（长度 = mat.cols）、QMatrix；输出：QTensor。
+def linear(x, mat, quantize=True):
+    """输入：QTensor x（长度 = mat.cols）、QMatrix、是否量化输出；输出：QTensor。
 
-    预期行为：acc_i = sum_j w_ij * x_j，实值 = acc_i * s_w[i] * s_x；再按 per-tensor
-              动态口径量化回 int8，对应训练侧的 fq_act(F.linear(fq_act(x), fq_w(W)))。
+    预期行为：acc_i = sum_j w_ij * x_j，实值 = acc_i * s_w[i] * s_x。quantize=True 时再按
+              per-tensor 动态口径量化回 int8（= 训练侧的 fq_act 包住这一层）；
+              False 时返回未量化的原始结果（= 训练侧 FakeQuantizedLinear 的输出，
+              它只量化输入与权重）。
 
-    注意训练侧只量化权重、**不再单独量化输入激活**这一处：模型里输入已经在上一个
-    fq_act 点被量化过，所以这里直接用 x 的码与 scale，不重复量化。
+    注意训练侧的线性层**不再单独量化输入激活**：模型里输入已经在上一个 fq_act 点被
+    量化过，所以这里直接用 x 的码与 scale，不重复量化。
     """
     assert len(x.codes) == mat.cols, "输入宽度与权重列数不一致"
     accs, scales = [], []
@@ -112,4 +120,4 @@ def linear(x, mat):
             acc += mat.codes[base + j] * x.codes[j]
         accs.append(acc)
         scales.append(mul(mat.scales[i], x.scale))
-    return _quantize_rows(accs, scales)
+    return _quantize_rows(accs, scales, quantize)

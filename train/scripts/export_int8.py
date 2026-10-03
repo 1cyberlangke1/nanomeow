@@ -34,10 +34,11 @@ from src.qat import (  # noqa: E402
 
 EPS = torch.finfo(torch.float32).smallest_normal
 
-# 低秩对 (in, out)：存储形状是 (C, D) 或 (D, C)，量化口径是「按 out 通道 per-row」，
-# 所以导出时统一转成 (out, in) 的行主序，正好也是 GEMV 要的布局。
+# 低秩对 (in, out)：存储形状是 (C, D) 或 (D, C)，模型里一律是
+# `F.linear(x, p.transpose(0, 1))` 用的，所以导出布局统一取 p 的转置 = (out, in) 行主序，
+# 正好也是 GEMV 要的形状。**两个方向都要转**：只转 (C, D) 那一半会让 (D, C) 那一半的
+# per-row 归约维反过来（实测 w2/a2/v2/g2 的 scale 数与训练侧不符）。
 LOWRANK = ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2")
-LOWRANK_C_FIRST = ("w1", "a1", "v1", "g1")
 
 
 def choose_scale(x, dim):
@@ -97,8 +98,7 @@ def collect(model):
         elif name.endswith(".weight") and tensor.dim() == 2:
             items.append((name, tensor, True))
         elif base in LOWRANK and tensor.dim() == 2:
-            t = tensor.transpose(0, 1) if base in LOWRANK_C_FIRST else tensor
-            items.append((name, t, True))
+            items.append((name, tensor.transpose(0, 1), True))
         else:
             items.append((name, tensor.reshape(-1), False))
     return items

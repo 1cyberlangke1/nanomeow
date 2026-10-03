@@ -24,7 +24,7 @@
     y_j      = sum_i q_code[i] * S[i][j]                   （scale = s_q * s_k * s_v）
 """
 
-from .fixed import apply_scale, mul, round_div
+from .fixed import apply_scale, div, mul, round_div
 from .int8_model import QTensor
 from .nonlinear import ONE, exp_q, from_fixed, to_fixed
 from .norm import isqrt
@@ -72,14 +72,19 @@ def decay_q15(w):
     return out
 
 
-def wkv7_recurrence(q, k, v, a, b, w15, state, head_size):
+def wkv7_recurrence(q, k, v, a, b, w15, state, head_size, step_prev=None):
     """输入：q / k / v / a / b 各是 QTensor（长度 T*C，C = n_head * head_size）；
               w15 是长度 T*C 的 Q15 整数码（`decay_q15` 的输出）；
               state 是 (n_head, head_size, head_size) 的整数列表（**就地更新**）；
+              step_prev 是 state 里整数当前用的单位（上一个 token 的 s_k * s_v），
+              None 表示 state 是全零（首 token）；
     输出：y 的 QTensor，长度 T*C，scale = s_q * s_k * s_v。
 
     预期行为：逐 token 逐 head 跑「sa → 更新 state → y」，全部整数运算；
-              state 的单位就是 step = s_k * s_v，所以不需要额外 round 到网格。
+              state 的单位是 step = s_k * s_v，落在训练侧 int32 网格上。
+              训练侧每个 chunk 边界都做 `state = round(state / state_step) * state_step`，
+              而逐 token 推理时每个 token 的 step 都不同（per-tensor 动态），所以旧 state
+              必须先从 step_prev 换算到当前 step 再参与递推，否则会系统性偏大。
     """
     c = len(q.codes)
     n_head = len(state)
@@ -88,6 +93,16 @@ def wkv7_recurrence(q, k, v, a, b, w15, state, head_size):
     assert c % (n_head * n) == 0, "通道数必须是 n_head * head_size 的整数倍"
     t_len = c // (n_head * n)
     step = mul(k.scale, v.scale)
+    if step_prev is not None:
+        # 换单位：state 实值不变，只是整数单位从 step_prev 变成 step，
+        # 取整口径与训练侧 `_Round` 一致（四舍六入五成双）。
+        ratio = div(step_prev, step)
+        for h in range(n_head):
+            s = state[h]
+            for i in range(n):
+                row = s[i]
+                for j in range(n):
+                    row[j] = apply_scale(row[j], ratio)
     ab_scale = mul(b.scale, a.scale)
     ys = [0] * c
     for t in range(t_len):
