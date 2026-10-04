@@ -15,6 +15,7 @@
 
 #define NM_GPIOA_CRH   (*(volatile uint32_t *)0x40010804u)
 #define NM_GPIOB_CRL   (*(volatile uint32_t *)0x40010C00u)
+#define NM_GPIOB_CRH   (*(volatile uint32_t *)0x40010C04u)
 #define NM_GPIOB_IDR   (*(volatile uint32_t *)0x40010C08u)
 #define NM_GPIOB_BSRR  (*(volatile uint32_t *)0x40010C10u)
 #define NM_GPIOB_BRR   (*(volatile uint32_t *)0x40010C14u)
@@ -23,6 +24,12 @@
 #define NM_USART1_DR   (*(volatile uint32_t *)0x40013804u)
 #define NM_USART1_BRR  (*(volatile uint32_t *)0x40013808u)
 #define NM_USART1_CR1  (*(volatile uint32_t *)0x4001380Cu)
+
+/* 内核私有区（0xE0000000 起）：DWT 的 32 位周期计数器，用来量生成速度（tps）。
+ * TRCENA 是 DEMCR 的 bit24、CYCCNTENA 是 DWT_CTRL 的 bit0；72 MHz 下计数器约 59.6 s 回绕一圈。 */
+#define NM_DEMCR      (*(volatile uint32_t *)0xE000EDFCu)
+#define NM_DWT_CTRL   (*(volatile uint32_t *)0xE0001000u)
+#define NM_DWT_CYCCNT (*(volatile uint32_t *)0xE0001004u)
 
 /* RCC_APB2ENR 的使能位 */
 #define NM_APB2_IOPAEN   (1u << 2)

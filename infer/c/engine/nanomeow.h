@@ -37,7 +37,8 @@
  *   per-row   ：[尾数 23 位打包][1 B 基线 shift][1 B 增量位宽 w][增量 w 位打包][索引 idx_bits 位打包]。
  * 尾数最高位恒 1、每张量的 shift 又几乎不变，这两条前提让 scale 表从 6,516 B 压到约 5.5 KB；
  * 行去重再把权重码省约 1.5 KB。两项都是无损的，运行期按需解出当前行的那一份。
- * rows/cols/per_row/idx_bits 收成位域 —— 四项合计仍是一个 32 位字。
+ * rows/cols/per_row/idx_bits 收成位域，四项合计 23 位，再用一个匿名位域补齐到 32 位 ——
+ * 不补的话 clang 会报 -Wpadded（位域单元里剩 9 位没写满）。
  * rows/cols 上限 511，超出时生成器会先报错，不会静默截断。 */
 typedef struct {
     uint16_t code_off;
@@ -46,6 +47,7 @@ typedef struct {
     uint32_t cols : 9;
     uint32_t per_row : 1;
     uint32_t idx_bits : 4;
+    uint32_t : 9;
 } nm_mat;
 
 /* 权重池：所有张量的 int8 码与 scale 位流首尾相接拼成的一块常量，描述符里的偏移都相对它。

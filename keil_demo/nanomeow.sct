@@ -1,0 +1,14 @@
+; nanomeow 的 Keil 链接脚本（scatter file）
+; 输入：各目标文件。输出：装载区 LR_1。
+; 预期行为：向量表（RESET 段）钉在 0x08000000 最前面，其余只读内容跟在后面；
+;           RW/ZI 全部落在 20 KiB SRAM 里。*(InRoot$$Sections) 是 __main 做 scatter-loading 用的。
+LR_1 0x08000000 0x00010000 {
+  ER_IROM1 0x08000000 0x00010000 {
+    *(RESET, +First)
+    *(InRoot$$Sections)
+    .ANY (+RO)
+  }
+  RW_IRAM1 0x20000000 0x00005000 {
+    .ANY (+RW +ZI)
+  }
+}

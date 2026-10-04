@@ -1,14 +1,16 @@
-/* nanomeow 的 SSD1306 传输层：STM32F103C8T6 上 PB6 = SCL、PB7 = SDA 的软件 I2C。
+/* nanomeow 的 SSD1306 传输层：STM32F103C8T6 上软件 I2C 的位操作。
  *
  * 为什么软件 I2C：SSD1306 只要 ~400 kHz，位操作够用，还省掉硬件 I2C 的事件状态机与中断
  * （那套在 -Oz 下也要几百字节）。两个引脚都配成开漏输出，SDA 靠读 IDR 取回总线电平收 ACK。
  * 半周期长度由 NM_OLED_I2C_DELAY 调：72 MHz 下大约 (count * 4 + 8) 个周期，16 约合 1 µs。
+ * SCL / SDA 的引脚号来自 nm_board.h（工程里由 User/config.h 指定），两个脚必须同属 GPIOB。
  */
 #include "nm_oled.h"
+#include "nm_board.h"
 #include "nm_stm32f103.h"
 
-#define NM_OLED_SCL_PIN 6
-#define NM_OLED_SDA_PIN 7
+#define NM_OLED_SCL_BIT (1u << NM_OLED_SCL_PIN)
+#define NM_OLED_SDA_BIT (1u << NM_OLED_SDA_PIN)
 #define NM_OLED_I2C_DELAY 16
 
 static void nm_i2c_delay(void)
@@ -16,10 +18,10 @@ static void nm_i2c_delay(void)
     for (volatile int i = 0; i < NM_OLED_I2C_DELAY; i++) { }
 }
 
-static void nm_i2c_scl_hi(void) { NM_GPIOB_BSRR = 1u << NM_OLED_SCL_PIN; }
-static void nm_i2c_scl_lo(void) { NM_GPIOB_BRR = 1u << NM_OLED_SCL_PIN; }
-static void nm_i2c_sda_hi(void) { NM_GPIOB_BSRR = 1u << NM_OLED_SDA_PIN; }
-static void nm_i2c_sda_lo(void) { NM_GPIOB_BRR = 1u << NM_OLED_SDA_PIN; }
+static void nm_i2c_scl_hi(void) { NM_GPIOB_BSRR = NM_OLED_SCL_BIT; }
+static void nm_i2c_scl_lo(void) { NM_GPIOB_BRR = NM_OLED_SCL_BIT; }
+static void nm_i2c_sda_hi(void) { NM_GPIOB_BSRR = NM_OLED_SDA_BIT; }
+static void nm_i2c_sda_lo(void) { NM_GPIOB_BRR = NM_OLED_SDA_BIT; }
 static int nm_i2c_sda_read(void) { return (int)((NM_GPIOB_IDR >> NM_OLED_SDA_PIN) & 1u); }
 
 /* 输入：无；输出：无。预期行为：SCL 高时 SDA 由高变低 = 起始条件。 */
@@ -56,11 +58,22 @@ static int nm_i2c_put(uint8_t byte)
     return ack;
 }
 
+/* 输入：引脚号 0..15；输出：无。预期行为：把该引脚配成通用开漏输出（软件 I2C 的空闲态）。
+ * 为什么不用 CMSIS：本工程只用 GPIOB 这一组寄存器，CRL 管 0..7、CRH 管 8..15，
+ * 每脚 4 位（MODE = 11 输出 50 MHz、CNF = 01 通用开漏 = 0x7），引脚号自己算更省 Flash。 */
+static void nm_gpio_od_out(int pin)
+{
+    volatile uint32_t *cr = pin < 8 ? &NM_GPIOB_CRL : &NM_GPIOB_CRH;
+    int sh = (pin & 7) * 4;
+
+    *cr = (*cr & ~(0xFu << sh)) | (0x7u << sh);
+}
+
 void nm_oled_port_init(void)
 {
     NM_RCC_APB2ENR |= NM_APB2_IOPBEN;
-    /* CRL 里每个引脚 4 位：MODE = 11（输出 50 MHz）、CNF = 01（通用开漏）→ 0x7。 */
-    NM_GPIOB_CRL = (NM_GPIOB_CRL & ~0xFF000000u) | 0x77000000u;
+    nm_gpio_od_out(NM_OLED_SCL_PIN);
+    nm_gpio_od_out(NM_OLED_SDA_PIN);
     nm_i2c_sda_hi();
     nm_i2c_scl_hi();
 }

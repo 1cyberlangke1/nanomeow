@@ -65,6 +65,17 @@ build-*/
 *.dll
 *.so
 
+# Keil MDK 工程产物（keil_demo/）
+keil_demo/Objects/
+keil_demo/Listings/
+*.uvguix.*
+*.dep
+*.crf
+*.lnp
+*.iex
+*.build_log.htm
+JLinkLog.txt
+
 # AI AGENT 本地笔记（不入库）
 AGENTS.md
 PLAN.md

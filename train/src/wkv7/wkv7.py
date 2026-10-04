@@ -58,7 +58,7 @@ bf16 只有 8 位尾数，解病态三角系统时误差会被放大。模型其
 
 import torch
 
-from .qat import _Round
+from ..qat import _Round
 
 CHUNK = 16
 

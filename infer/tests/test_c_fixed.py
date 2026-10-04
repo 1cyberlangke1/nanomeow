@@ -37,7 +37,8 @@ def _build(tmp_path):
     exe = tmp_path / "nm_fixed_selftest.exe"
     subprocess.run(
         [GCC, "-std=c99", "-O2", "-Wall", "-Wextra", "-Werror",
-         "-o", str(exe), str(C_DIR / "nm_fixed_selftest.c")],
+         "-I", str(C_DIR / "engine"),
+         "-o", str(exe), str(C_DIR / "selftest" / "nm_fixed_selftest.c")],
         check=True, capture_output=True, text=True)
     return exe
 

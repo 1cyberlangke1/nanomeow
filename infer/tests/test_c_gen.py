@@ -29,6 +29,9 @@ from src.generate import build_prompt  # noqa: E402
 from src.tokenizer import ETX_ID, UTF8StreamDecoder, encode  # noqa: E402
 
 C_DIR = HERE.parents[1] / "c"
+# 头文件分散在 engine / generated / display / platform 四个子目录，编译时一起加 -I
+C_INCLUDES = [a for p in ("", "engine", "generated", "display", "platform")
+              for a in ("-I", str(C_DIR / p))]
 CKPT = latest_ckpt()
 GCC = shutil.which("gcc")
 Q16 = 65536
@@ -39,7 +42,7 @@ def _compile(tmp_path, name, sources):
     """输入：临时目录、可执行名、源文件列表；输出：编译好的路径。预期行为：-Werror 一次编过。"""
     exe = tmp_path / name
     subprocess.run(
-        [GCC, "-std=c99", "-O2", "-Wall", "-Wextra", "-Werror", "-I", str(C_DIR),
+        [GCC, "-std=c99", "-O2", "-Wall", "-Wextra", "-Werror", *C_INCLUDES,
          "-o", str(exe)] + [str(s) for s in sources],
         check=True, capture_output=True, text=True)
     return exe
@@ -49,15 +52,15 @@ def _compile(tmp_path, name, sources):
 def chat_exe(tmp_path_factory):
     """输入：无；输出：主机端生成 CLI（prompt 走 stdin，生成字节走 stdout）。"""
     return _compile(tmp_path_factory.mktemp("c_gen"), "nm_chat.exe",
-                    [C_DIR / "nm_chat.c", C_DIR / "nm_gen.c", C_DIR / "nanomeow.c",
-                     C_DIR / "nm_weights.c"])
+                    [C_DIR / "host" / "nm_chat.c", C_DIR / "engine" / "nm_gen.c",
+                     C_DIR / "engine" / "nanomeow.c", C_DIR / "generated" / "nm_weights.c"])
 
 
 @pytest.fixture(scope="module")
 def utf8_exe(tmp_path_factory):
     """输入：无；输出：增量 UTF-8 解码器的对拍 CLI。"""
     return _compile(tmp_path_factory.mktemp("c_utf8"), "nm_utf8.exe",
-                    [C_DIR / "nm_utf8_selftest.c"])
+                    [C_DIR / "selftest" / "nm_utf8_selftest.c"])
 
 
 def _bytes(text):

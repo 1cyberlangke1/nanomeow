@@ -5,7 +5,7 @@
 （跑一个 token 真正执行多少条）。两者共用 build_firmware.py 的 CFLAGS / SOURCES / INCLUDES，
 不另抄一份口径，免得两边漂移。
 
-输入：infer/c 下的固件源码；主机侧拿 infer/c/nm_bench.c 当驱动。
+输入：infer/c 下的固件源码；主机侧拿 infer/c/host/nm_bench.c 当驱动。
 输出：stdout 的「每函数 / 每源文件」每 token 动态指令估算表，以及总量与粗估周期。
 预期行为：这是**估算**，不是目标机实测：
   ① 每行执行次数来自主机 gcc -O0 --coverage 跑 nm_bench（热身 64 次 + 计时 T 次）；
@@ -34,14 +34,15 @@ DEFAULT_GCOV = r"C:\msys64\ucrt64\bin\gcov.exe"
 
 # gcov 口径只编前向路径真正会跑到的文件：OLED 显示层与上板入口（nm_fw.c）不跑，不编。
 HOST_SOURCES = [
-    "infer/c/nanomeow.c",
-    "infer/c/nm_gen.c",
-    "infer/c/nm_weights.c",
-    "infer/c/nm_font.c",
-    "infer/c/nm_bench.c",
+    "infer/c/engine/nanomeow.c",
+    "infer/c/engine/nm_gen.c",
+    "infer/c/generated/nm_weights.c",
+    "infer/c/generated/nm_font.c",
+    "infer/c/host/nm_bench.c",
 ]
 HOST_CFLAGS = ["-std=c99", "-O0", "-g", "--coverage", "-w"]
-HOST_INCLUDES = ["infer/c", "infer"]
+HOST_INCLUDES = ["infer/c", "infer/c/engine", "infer/c/generated", "infer/c/display",
+                 "infer/c/platform", "infer"]
 
 WARMUP = 64  # nm_bench.c 计时前先跑 64 次热身（见该文件），算每 token 均值时要一起除
 

@@ -86,7 +86,9 @@ int main(void)
     check(memcmp(glyph, nm_font_fallback, NM_FONT_ROW) == 0, "越界码点必须给兜底", 0);
 
     /* UTF-8 入口：把第一个码点编成 UTF-8，必须解出同一个字形；半截 / 非法序列给兜底 */
-    if (cps[0] < 0x800) {
+    if (cps[0] < 0x80) {                 /* 单字节：字库收录了 ASCII，首码点可能就在这一段 */
+        buf[n++] = (uint8_t)cps[0];
+    } else if (cps[0] < 0x800) {
         buf[n++] = (uint8_t)(0xC0 | (cps[0] >> 6));
         buf[n++] = (uint8_t)(0x80 | (cps[0] & 0x3F));
     } else {

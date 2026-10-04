@@ -15,6 +15,11 @@ import pytest
 
 HERE = pathlib.Path(__file__).resolve()
 C_DIR = HERE.parents[1] / "c"
+# 头文件分散在 engine / generated / display / platform 四个子目录，编译时一起加 -I
+C_INCLUDES = [a for p in ("", "engine", "generated", "display", "platform")
+              for a in ("-I", str(C_DIR / p))]
+# 板级入口住在 Keil 工程里（keil_demo/User/main.c），两条构建路径共用同一份，不再是 c/nm_fw.c。
+FW_MAIN = HERE.parents[2] / "keil_demo" / "User" / "main.c"
 GCC = shutil.which("gcc")
 
 
@@ -22,9 +27,9 @@ GCC = shutil.which("gcc")
 def test_oled_selftest(tmp_path):
     """输入：tmp_path；输出：无。预期行为：C 自检编译无警告并通过。"""
     exe = tmp_path / "nm_oled_selftest.exe"
-    subprocess.run([GCC, "-std=c99", "-O2", "-Wall", "-Wextra", "-Werror", "-I", str(C_DIR),
-                    "-o", str(exe), str(C_DIR / "nm_oled_selftest.c"),
-                    str(C_DIR / "nm_oled.c"), str(C_DIR / "nm_font.c")],
+    subprocess.run([GCC, "-std=c99", "-O2", "-Wall", "-Wextra", "-Werror", *C_INCLUDES,
+                    "-o", str(exe), str(C_DIR / "selftest" / "nm_oled_selftest.c"),
+                    str(C_DIR / "display" / "nm_oled.c"), str(C_DIR / "generated" / "nm_font.c")],
                    check=True, capture_output=True, text=True)
     proc = subprocess.run([str(exe)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -33,7 +38,7 @@ def test_oled_selftest(tmp_path):
 
 def test_init_sequence_covers_128x64():
     """输入：无；输出：无。预期行为：初始化序列必须开电荷泵、置复用比 64、用水平寻址、开显示。"""
-    src = (C_DIR / "nm_oled.c").read_text(encoding="utf-8")
+    src = (C_DIR / "display" / "nm_oled.c").read_text(encoding="utf-8")
     m = re.search(r"nm_init_seq\[\] = \{(.*?)\};", src, re.S)
     assert m, "nm_oled.c 里找不到初始化序列"
     seq = [int(v, 16) for v in re.findall(r"0x[0-9A-Fa-f]{2}", m.group(1))]
@@ -44,13 +49,13 @@ def test_init_sequence_covers_128x64():
 
 def test_firmware_prompt_template_has_no_space_after_colon():
     """输入：无；输出：无。预期行为：固件拼的提示词是 user:<内容>\\nbot:，冒号后没有空格。"""
-    src = (C_DIR / "nm_fw.c").read_text(encoding="utf-8")
+    src = FW_MAIN.read_text(encoding="utf-8")
     assert '"user:"' in src and '"bot:"' in src
     assert '"user: ' not in src and '"bot: ' not in src
 
 
 def test_oled_layer_is_float_free():
     """输入：无；输出：无。预期行为：显示层与上板入口不许出现 float / double。"""
-    for name in ("nm_oled.c", "nm_oled_port.c", "nm_fw.c"):
-        src = (C_DIR / name).read_text(encoding="utf-8")
-        assert not re.search(r"\b(float|double)\b", src), "%s 里出现了浮点类型" % name
+    for path in (C_DIR / "display" / "nm_oled.c", C_DIR / "display" / "nm_oled_port.c", FW_MAIN):
+        src = path.read_text(encoding="utf-8")
+        assert not re.search(r"\b(float|double)\b", src), "%s 里出现了浮点类型" % path.name

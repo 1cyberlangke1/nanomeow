@@ -14,8 +14,15 @@
 
 #define NM_OLED_W 128                  /* 屏宽（像素） */
 #define NM_OLED_H 64                   /* 屏高（像素） */
-#define NM_OLED_PAGES (NM_OLED_H / 8)  /* 8 页，一页 = 一行字 */
-#define NM_OLED_COLS (NM_OLED_W / 8)   /* 一行 16 个字 */
+#define NM_OLED_PAGES (NM_OLED_H / 8)  /* 8 页 */
+
+/* 字号：字库是 8x8，上屏时每个像素铺成 SCALE x SCALE 个像素。SCALE=1 就是原始 8x8 点阵。 */
+#define NM_OLED_SCALE 2
+#define NM_OLED_CELL (8 * NM_OLED_SCALE)          /* 一个字的像素边长（SCALE=2 时 16） */
+#define NM_OLED_COLS (NM_OLED_W / NM_OLED_CELL)   /* 一行几个字（SCALE=2 时 8） */
+#define NM_OLED_LINE_PAGES NM_OLED_SCALE          /* 一行字占几页（SCALE=2 时 2） */
+/* 正文区页数：最后 LINE_PAGES 页留给右下角的常驻状态（tps），它跟正文同一个字号。 */
+#define NM_OLED_TEXT_PAGES (NM_OLED_PAGES - NM_OLED_LINE_PAGES)
 
 /* SSD1306 的 I2C 从地址（7 位 0x3C 左移一位）。 */
 #define NM_OLED_I2C_ADDR 0x78u
@@ -36,11 +43,17 @@ void nm_oled_flush(void);
 /* 输入：无；输出：无。预期行为：光标回到左上角（不清屏、不刷屏）。 */
 void nm_oled_home(void);
 
+/* 输入：页号与列号（单位都是字）；输出：无。预期行为：把光标挪到那个格子（越界就忽略）。
+ * 页号上限是 NM_OLED_PAGES - NM_OLED_LINE_PAGES —— 再往下字块会整个画出屏外。
+ * 给「在固定位置画东西」用 —— 画完光标留在那儿，调用方自己负责后续。 */
+void nm_oled_goto(int page, int col);
+
 /* 输入：无；输出：无。预期行为：换到下一行；已经在最后一行则整屏上滚一页。 */
 void nm_oled_newline(void);
 
 /* 输入：一个码点；输出：无。预期行为：'\n' 换行，其余控制字符不占格，可打印字符画字库
- *           字形（字库外给兜底方框）并右移一格，行尾自动换行。 */
+ *           字形（字库外给兜底方框）并右移一格；正文区行尾自动换行，状态页（最后一页）行尾
+ *           停在最后一格 —— 状态行是固定位置的常驻行，不参与正文流动、不触发滚动。 */
 void nm_oled_putc(uint32_t cp);
 
 /* 输入：一个字符的 UTF-8 字节与字节数（1..4）；输出：无。
@@ -50,5 +63,9 @@ void nm_oled_put_utf8(const uint8_t *b, int n);
 /* 输入：任意字节流与长度；输出：无。预期行为：内部做增量 UTF-8 解码，只画完整字符，
  *           结尾没凑齐的半截序列直接丢掉（上板时用来回显串口收到的一行）。 */
 void nm_oled_puts(const uint8_t *s, int n);
+
+/* 输入：一个无符号整数；输出：无。预期行为：按十进制画出来（最高位在前、不补前导零、
+ *           0 画一个 '0'），只画数字、不做对齐 —— 给上板显示 tps 这类小数字用。 */
+void nm_oled_putu(uint32_t v);
 
 #endif

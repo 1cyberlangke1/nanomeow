@@ -1,6 +1,6 @@
 """字库闸门：生成的 C 字库 == 子集清单 == BDF 原件，逐位一致。
 
-输入：infer/font/subset_8x8.txt、infer/c/nm_font.c、infer/c/nm_font.h，
+输入：infer/font/subset_8x8.txt、infer/c/generated/nm_font.c、infer/c/generated/nm_font.h，
       以及（本机有的话）tmp/f8bdf 下的 fusion-pixel 8px 等宽 BDF。
 输出：pytest 断言；BDF 不在时那条用例 skip（干净 clone 没有 tmp/）。
 预期行为：C 里的码点表 / 点阵位流必须与清单逐字节相同；清单里的每个字形必须与 BDF 原件
@@ -22,6 +22,9 @@ sys.path.insert(0, str(REPO / "infer"))
 from font.select_subset import parse_bdf, packed, to_cell  # noqa: E402
 
 C_DIR = REPO / "infer" / "c"
+# 头文件分散在 engine / generated / display / platform 四个子目录，编译时一起加 -I
+C_INCLUDES = [a for p in ("", "engine", "generated", "display", "platform")
+              for a in ("-I", str(C_DIR / p))]
 SUBSET = REPO / "infer" / "font" / "subset_8x8.txt"
 BDF_DIR = REPO / "tmp" / "f8bdf"
 GCC = shutil.which("gcc")
@@ -36,14 +39,14 @@ def read_subset():
     for line in SUBSET.read_text(encoding="utf-8").splitlines():
         if not line or line.startswith("#"):
             continue
-        cp_hex, blob_hex, _ = line.split(" ")
+        cp_hex, blob_hex, _ = line.split(" ", 2)   # 第 3 段是注释字符，可能本身就是空格
         out.append((int(cp_hex, 16), bytes.fromhex(blob_hex)))
     return out
 
 
 def read_c_array(name):
     """输入：C 数组名；输出：它的 int 值列表。预期行为：找不到数组就断言失败。"""
-    text = (C_DIR / "nm_font.c").read_text(encoding="utf-8")
+    text = (C_DIR / "generated" / "nm_font.c").read_text(encoding="utf-8")
     m = re.search(r"const uint8_t %s\[(\d+)\] = \{(.*?)\};" % re.escape(name), text, re.S)
     assert m, "nm_font.c 里找不到数组 %s" % name
     values = [int(v) for v in m.group(2).replace("\n", " ").split(",") if v.strip()]
@@ -90,7 +93,7 @@ def unpack(packed, n):
 
 def test_header_matches_c():
     """输入：无；输出：无。预期行为：nm_font.h 的常量与 nm_font.c 的实际长度一致。"""
-    header = (C_DIR / "nm_font.h").read_text(encoding="utf-8")
+    header = (C_DIR / "generated" / "nm_font.h").read_text(encoding="utf-8")
     consts = {k: int(v) for k, v in re.findall(r"#define (NM_FONT_\w+) (\d+)", header)}
     assert consts["NM_FONT_N"] == len(read_subset())
     assert consts["NM_FONT_CP_BYTES"] == len(read_c_array("nm_font_cp"))
@@ -136,8 +139,9 @@ def test_subset_matches_bdf():
 def test_c_selftest(tmp_path):
     """输入：tmp_path；输出：无。预期行为：C 自检编译无警告并通过。"""
     exe = tmp_path / "nm_font_selftest.exe"
-    subprocess.run([GCC, "-std=c99", "-O2", "-Wall", "-Wextra", "-Werror", "-I", str(C_DIR),
-                    "-o", str(exe), str(C_DIR / "nm_font_selftest.c"), str(C_DIR / "nm_font.c")],
+    subprocess.run([GCC, "-std=c99", "-O2", "-Wall", "-Wextra", "-Werror", *C_INCLUDES,
+                    "-o", str(exe), str(C_DIR / "selftest" / "nm_font_selftest.c"),
+                    str(C_DIR / "generated" / "nm_font.c")],
                    check=True, capture_output=True, text=True)
     proc = subprocess.run([str(exe)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr

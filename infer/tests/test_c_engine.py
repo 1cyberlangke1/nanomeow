@@ -25,6 +25,9 @@ from ref.nonlinear import EXP_LUT, LOG1P_LUT  # noqa: E402
 from ref.weights import load_weights  # noqa: E402
 
 C_DIR = HERE.parents[1] / "c"
+# 头文件分散在 engine / generated / display / platform 四个子目录，编译时一起加 -I
+C_INCLUDES = [a for p in ("", "engine", "generated", "display", "platform")
+              for a in ("-I", str(C_DIR / p))]
 CKPT = latest_ckpt()
 DATASET = REPO / "train" / "dataset" / "nana_clean.jsonl"
 GCC = shutil.which("gcc")
@@ -38,9 +41,9 @@ def engine_exe(tmp_path_factory):
     """输入：无；输出：编译好的 C 引擎路径。预期行为：gcc 一次编过，无警告（-Werror）。"""
     exe = tmp_path_factory.mktemp("c_engine") / "nm_engine.exe"
     subprocess.run(
-        [GCC, "-std=c99", "-O2", "-Wall", "-Wextra", "-Werror", "-I", str(C_DIR),
-         "-o", str(exe), str(C_DIR / "nm_engine_selftest.c"), str(C_DIR / "nanomeow.c"),
-         str(C_DIR / "nm_weights.c")],
+        [GCC, "-std=c99", "-O2", "-Wall", "-Wextra", "-Werror", *C_INCLUDES,
+         "-o", str(exe), str(C_DIR / "selftest" / "nm_engine_selftest.c"),
+         str(C_DIR / "engine" / "nanomeow.c"), str(C_DIR / "generated" / "nm_weights.c")],
         check=True, capture_output=True, text=True)
     return exe
 

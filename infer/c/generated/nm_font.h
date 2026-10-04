@@ -1,12 +1,12 @@
-/* 自动生成，请勿手改：infer/c/gen_font.py */
+/* 自动生成，请勿手改：infer/c/tools/gen_font.py */
 #ifndef NANOMEOW_FONT_H
 #define NANOMEOW_FONT_H
 
 #include <stdint.h>
 
-#define NM_FONT_N 701          /* 收录字符数 */
-#define NM_FONT_CP_BYTES 736   /* 码点表字节数 */
-#define NM_FONT_PACKED_BYTES 4295   /* 点阵位流字节数（含表尾 1 个 0 补位） */
+#define NM_FONT_N 730          /* 收录字符数 */
+#define NM_FONT_CP_BYTES 766   /* 码点表字节数 */
+#define NM_FONT_PACKED_BYTES 4473   /* 点阵位流字节数（含表尾 1 个 0 补位） */
 #define NM_FONT_W 8           /* 点阵宽（含原字体的右侧字间距列） */
 #define NM_FONT_H 8           /* 点阵高（含原字体的顶部空行） */
 #define NM_FONT_ROW 7         /* 实际存的像素行数：原字体第 0 行恒空 */

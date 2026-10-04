@@ -1,4 +1,4 @@
-/* 自动生成，请勿手改：infer/c/gen_lut.py
+/* 自动生成，请勿手改：infer/c/tools/gen_lut.py
  *
  * 两张 Q15 表不原样存，存的是「初值 v0 + 首差 d0 + 每步 2 bit 二阶差」位流：
  *   v[0] = v0;  d[0] = d0;

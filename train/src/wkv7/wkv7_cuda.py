@@ -40,7 +40,7 @@ def _ensure_msvc_env():
     os.environ["MSSdk"] = "1"
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_BUILD = os.path.join(os.path.dirname(_HERE), "out", "ext_cache")
+_BUILD = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "out", "ext_cache")
 
 _ext = None
 

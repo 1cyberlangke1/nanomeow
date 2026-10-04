@@ -62,25 +62,35 @@ static void check(int ok, const char *what, long arg)
     if (!ok) { printf("FAIL %s (%ld)\n", what, arg); failures++; }
 }
 
-/* 输入：7 行点阵；输出：8 个竖排字节。预期行为：字库第 r 行 → 页内 bit(r+1)，
- * 字库 bit(7-c) → 第 c 列，与 nm_oled_blit 同一口径。 */
-static void expect_cell(const uint8_t *glyph, uint8_t *out)
+/* 输入：7 行点阵；输出：按页组织的字块（NM_OLED_LINE_PAGES 页 x NM_OLED_CELL 列）。
+ * 预期行为：字库第 r 行第 c 列的点铺成 NM_OLED_SCALE x NM_OLED_SCALE 的实心方块，落在
+ * 字块相对像素 (r*SCALE, c*SCALE)，与 nm_oled_blit 同一口径。 */
+static void expect_cell(const uint8_t *glyph, uint8_t out[NM_OLED_LINE_PAGES][NM_OLED_CELL])
 {
-    int r, c;
+    int r, c, dy, dx;
 
-    memset(out, 0, 8);
+    memset(out, 0, NM_OLED_LINE_PAGES * NM_OLED_CELL);
     for (r = 0; r < NM_FONT_ROW; r++)
         for (c = 0; c < 8; c++)
             if (glyph[r] & (uint8_t)(0x80u >> c))
-                out[c] |= (uint8_t)(1u << (r + 1));
+                for (dy = 0; dy < NM_OLED_SCALE; dy++) {
+                    int y = r * NM_OLED_SCALE + dy;
+
+                    for (dx = 0; dx < NM_OLED_SCALE; dx++)
+                        out[y / 8][c * NM_OLED_SCALE + dx] |= (uint8_t)(1u << (y % 8));
+                }
 }
 
 static int cell_is(int page, int col, const uint8_t *glyph)
 {
-    uint8_t want[8];
+    uint8_t want[NM_OLED_LINE_PAGES][NM_OLED_CELL];
+    int k;
 
     expect_cell(glyph, want);
-    return memcmp(dram[page] + col * 8, want, 8) == 0;
+    for (k = 0; k < NM_OLED_LINE_PAGES; k++)
+        if (memcmp(dram[page + k] + col * NM_OLED_CELL, want[k], NM_OLED_CELL) != 0)
+            return 0;
+    return 1;
 }
 
 /* 输入：页、列、BMP 码点；输出：1 表示该格正好是那个码点的字形。
@@ -104,10 +114,11 @@ static int in_font(uint32_t cp)
 
 static int cell_is_zero(int page, int col)
 {
-    int i;
+    int k, i;
 
-    for (i = 0; i < 8; i++)
-        if (dram[page][col * 8 + i]) return 0;
+    for (k = 0; k < NM_OLED_LINE_PAGES; k++)
+        for (i = 0; i < NM_OLED_CELL; i++)
+            if (dram[page + k][col * NM_OLED_CELL + i]) return 0;
     return 1;
 }
 
@@ -144,18 +155,19 @@ int main(void)
     reset_bus();
     nm_oled_putc('A');
     nm_oled_flush();
-    check(n_cmd == 1 && n_data == 1, "单字符只应刷一页", n_cmd * 10 + n_data);
+    check(n_cmd == NM_OLED_LINE_PAGES && n_data == NM_OLED_LINE_PAGES,
+          "单字符只应刷它占的那几页", n_cmd * 10 + n_data);
     check(cell_is_cp(0, 0, 'A'), "'A' 的落点", 0);
     for (c = 1; c < NM_OLED_COLS; c++)
         check(cell_is_zero(0, c), "'A' 不应动到别的格子", c);
 
-    /* 3. 一行 16 个字，第 17 个换行到 (1, 0) */
+    /* 3. 一行 NM_OLED_COLS 个字，行尾后第一个换到下一行（跨 NM_OLED_LINE_PAGES 页） */
     reset_bus();
     nm_oled_clear();
     for (i = 0; i < NM_OLED_COLS; i++) nm_oled_putc((uint32_t)('a' + i));
     nm_oled_putc('q');
     nm_oled_flush();
-    check(cell_is_cp(1, 0, 'q'), "第 17 个字应换行到 (1,0)", 0);
+    check(cell_is_cp(NM_OLED_LINE_PAGES, 0, 'q'), "行尾后的第一个字应换行", 0);
     check(cell_is_cp(0, 0, 'a'), "第一个字应留在 (0,0)", 0);
 
     /* 4. UTF-8 入口：「你好」两个三字节字符，都要用真字形（不是兜底） */
@@ -201,20 +213,34 @@ int main(void)
     nm_oled_flush();
     check(cell_is_cp(0, 0, 'A'), "控制字符后光标仍应停在 (0,0)", 0);
 
-    /* 8. 走到屏幕底部再换行：整屏上滚一页、末页清零 */
+    /* 8. 走到**正文区**底部再换行：正文区上滚 LINE_PAGES 页、末尾 LINE_PAGES 页清零，状态行不动 */
     reset_bus();
     nm_oled_clear();
-    for (i = 0; i < 7 * NM_OLED_COLS + 1; i++)
+    for (i = 0; i < NM_OLED_TEXT_PAGES * NM_OLED_COLS - 1; i++)
         nm_oled_putc((uint32_t)('A' + i % 26));
     nm_oled_flush();
-    check(cell_is_cp(7, 0, (uint32_t)('A' + (7 * NM_OLED_COLS) % 26)), "第 113 个字应落在 (7,0)", 0);
     memcpy(before, dram, sizeof(dram));
     nm_oled_newline();
     nm_oled_flush();
-    for (p = 0; p < NM_OLED_PAGES - 1; p++)
-        check(memcmp(dram[p], before[p + 1], NM_OLED_W) == 0, "上滚后每页应等于原下一页", p);
-    for (c = 0; c < NM_OLED_W; c++)
-        check(dram[NM_OLED_PAGES - 1][c] == 0, "上滚后末页必须清零", c);
+    for (p = 0; p < NM_OLED_TEXT_PAGES - NM_OLED_LINE_PAGES; p++)
+        check(memcmp(dram[p], before[p + NM_OLED_LINE_PAGES], NM_OLED_W) == 0,
+              "上滚后正文区每页应等于原下方 LINE_PAGES 页", p);
+    for (p = NM_OLED_TEXT_PAGES - NM_OLED_LINE_PAGES; p < NM_OLED_TEXT_PAGES; p++)
+        for (c = 0; c < NM_OLED_W; c++)
+            check(dram[p][c] == 0, "上滚后正文区末尾 LINE_PAGES 页必须清零", c);
+    for (p = NM_OLED_TEXT_PAGES; p < NM_OLED_PAGES; p++)
+        check(memcmp(dram[p], before[p], NM_OLED_W) == 0, "上滚不得动到状态行", p);
+
+    /* 9. 状态页行尾不换行、不滚动：在最后一格画字不得顶动正文区（tps 把它自己那行吃掉的回归闸门） */
+    reset_bus();
+    nm_oled_clear();
+    nm_oled_putc('A');                                  /* 正文区 (0,0) 留个记号 */
+    nm_oled_goto(NM_OLED_PAGES - NM_OLED_LINE_PAGES, NM_OLED_COLS - 1);  /* 状态行首行最后一格 */
+    nm_oled_putc('B');
+    nm_oled_flush();
+    check(cell_is_cp(0, 0, 'A'), "状态行画字不得滚动正文区", 0);
+    check(cell_is_cp(NM_OLED_PAGES - NM_OLED_LINE_PAGES, NM_OLED_COLS - 1, 'B'),
+          "状态行最后一格的落点", 0);
 
     if (failures) {
         printf("%d 项失败\n", failures);

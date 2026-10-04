@@ -1,7 +1,7 @@
-"""生成 infer/c/nm_lut.h：把 Python 参考的 exp / log1p 两张 Q15 表编码成 C 头文件。
+"""生成 infer/c/generated/nm_lut.h：把 Python 参考的 exp / log1p 两张 Q15 表编码成 C 头文件。
 
 输入：无（直接 import infer/ref/nonlinear.py，单一来源）。
-输出：infer/c/nm_lut.h。
+输出：infer/c/generated/nm_lut.h。
 预期行为：两张表不原样存，改存「初值 + 首差 + 每步 2 bit 二阶差」位流，C 侧 nm_lut_init()
           纯整数展开回原表。本脚本自带反解自检：解出来的表必须与 Python 侧逐项相同，
           二阶差跨度装不进 2 bit 时直接报错退出，绝不静默截断。
@@ -11,7 +11,7 @@ import pathlib
 import sys
 
 HERE = pathlib.Path(__file__).resolve()
-sys.path.insert(0, str(HERE.parents[1]))
+sys.path.insert(0, str(HERE.parents[2]))
 
 from ref.nonlinear import EXP_LUT, EXP_LUT_Q, LOG1P_LUT  # noqa: E402
 
@@ -75,16 +75,16 @@ def emit(name, table, fh):
 
 
 def main():
-    """输入：无；输出：无。预期行为：把两张表编码进 infer/c/nm_lut.h，并打印省下的字节数。"""
+    """输入：无；输出：无。预期行为：把两张表编码进 infer/c/generated/nm_lut.h，并打印省下的字节数。"""
     n = len(EXP_LUT)
     assert len(LOG1P_LUT) == n, "两张表长度必须一致"
-    nanomeow_h = (HERE.parents[0] / "nanomeow.h").read_text(encoding="utf-8")
+    nanomeow_h = (HERE.parents[1] / "engine" / "nanomeow.h").read_text(encoding="utf-8")
     want = "#define NM_LUT_N %d" % n
     if want not in nanomeow_h:
-        raise SystemExit("infer/c/nanomeow.h 里缺 `%s`，两边表长会不一致" % want)
-    out = HERE.parents[0] / "nm_lut.h"
+        raise SystemExit("infer/c/engine/nanomeow.h 里缺 `%s`，两边表长会不一致" % want)
+    out = HERE.parents[1] / "generated" / "nm_lut.h"
     with out.open("w", encoding="utf-8", newline="\n") as fh:
-        fh.write("/* 自动生成，请勿手改：infer/c/gen_lut.py\n")
+        fh.write("/* 自动生成，请勿手改：infer/c/tools/gen_lut.py\n")
         fh.write(" *\n")
         fh.write(" * 两张 Q15 表不原样存，存的是「初值 v0 + 首差 d0 + 每步 2 bit 二阶差」位流：\n")
         fh.write(" *   v[0] = v0;  d[0] = d0;\n")

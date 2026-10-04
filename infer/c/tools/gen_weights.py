@@ -1,8 +1,8 @@
-"""从 infer/model_weights.h 生成 C 引擎的权重描述表 infer/c/nm_weights.c。
+"""从 infer/model_weights.h 生成 C 引擎的权重描述表 infer/c/generated/nm_weights.c。
 
-输入：infer/model_weights.h（由 train/scripts/export_int8.py 生成）、infer/c/nanomeow.h 与
-      infer/c/nanomeow.c（用来统计引擎的运行期内存）。
-输出：infer/c/nm_weights.c（`nm_blocks[3]` 与四个顶层 `nm_mat` 的定义）。
+输入：infer/model_weights.h（由 train/scripts/export_int8.py 生成）、infer/c/engine/nanomeow.h 与
+      infer/c/engine/nanomeow.c（用来统计引擎的运行期内存）。
+输出：infer/c/generated/nm_weights.c（`nm_blocks[3]` 与四个顶层 `nm_mat` 的定义）。
 预期行为：把「int8 码 + 每行乘子 + 每行移位」**无损压缩**后装成 `nm_mat` ——
           头文件里 `<符号>_mul` 是数组的是 per-row（rows = 乘子条数、cols = 码数 / rows），
           是标量的是 per-tensor（rows = 1、cols = 码数）。
@@ -18,11 +18,11 @@ import pathlib
 import re
 
 HERE = pathlib.Path(__file__).resolve().parent
-HEADER = HERE.parent / "model_weights.h"
-ENGINE_H = HERE / "nanomeow.h"
-ENGINE_C = HERE / "nanomeow.c"
-OUT = HERE / "nm_weights.c"
-CFG = HERE.parent / "model_cfg.h"    # 结构常量的唯一来源，由导出脚本按 checkpoint 生成
+HEADER = HERE.parents[1] / "model_weights.h"
+ENGINE_H = HERE.parent / "engine" / "nanomeow.h"
+ENGINE_C = HERE.parent / "engine" / "nanomeow.c"
+OUT = HERE.parent / "generated" / "nm_weights.c"
+CFG = HERE.parents[1] / "model_cfg.h"    # 结构常量的唯一来源，由导出脚本按 checkpoint 生成
 N_LAYER = 3
 
 # nm_block 字段名 -> 头文件符号里 `nm_blocks_<层号>_` 之后的那一段
@@ -275,7 +275,7 @@ def parse_defines(text):
 def state_bytes(d):
     """输入：宏表；输出：单层 nm_layer_state 的字节数。
 
-    预期行为：镜像 infer/c/nanomeow.h 里 nm_layer_state 的布局 ——
+    预期行为：镜像 infer/c/engine/nanomeow.h 里 nm_layer_state 的布局 ——
               int8[NM_N_EMBD] + nm_scale + int 各两份（time-shift 的上一 token），
               再接 int32[n_head][head_size][head_size] + nm_scale + int。
               nm_scale 是 { int32_t m; int8_t e; }，按 4 字节对齐后占 8 字节。
@@ -305,6 +305,16 @@ def workspace_bytes(engine, d):
     return total, n
 
 
+# 引擎读不到的张量：nanomeow.c 在 `if (layer == 0)` 分支里直接取 v_first，value 残差的
+# v0 / v1 / v2 三个张量对第 0 层根本不参与计算（infer/ref/model.py 的 `if i == 0` 同样跳过，
+# 参考实现 Mini_RWKV_7 的第 0 层也没有 value 残差）。它们的码与 scale 因此不进权重池，
+# 描述符留空并在生成文件里写明原因 —— 去掉的是「引擎读不到的字节」，不是改架构：
+# 第 1 / 2 层的同名张量照旧完整导出，G1 逐位对拍仍是同一份数值。
+ENGINE_UNREACHABLE = frozenset((
+    "nmw_blocks_0_att_v0", "nmw_blocks_0_att_v1", "nmw_blocks_0_att_v2",
+))
+
+
 def main():
     """输入：无；输出：写 nm_weights.c 并在 stdout 打印一行摘要。"""
     hdr = HEADER.read_text(encoding="utf-8")
@@ -316,6 +326,8 @@ def main():
     blobs, pools, idxbits = {}, {}, {}
     code_total = 0
     for sym in tensors:
+        if sym in ENGINE_UNREACHABLE:
+            continue
         muls = int_list(hdr, sym + "_mul")
         shifts = int_list(hdr, sym + "_shift")
         codes = int_list(hdr, sym)
@@ -347,6 +359,9 @@ def main():
     # 所有码与 scale 位流拼进一个池：描述符只存 uint16 偏移，12 B -> 8 B（109 个共省 436 B）。
     pool, offs = bytearray(), {}
     for sym in tensors:
+        if sym in ENGINE_UNREACHABLE:
+            offs[sym] = (0, 0, 0, 0, 0, 0)
+            continue
         codes = pools[sym] if sym in pools else int_list(hdr, sym)
         code_off = len(pool)
         pool += bytes(v & 0xFF for v in codes)
@@ -355,10 +370,10 @@ def main():
         offs[sym] = (code_off, scale_off) + mat_shape(sym, lens, is_array, idxbits[sym])
     if len(pool) > 65535:
         raise SystemExit("自检失败：权重池 %d B 超过 uint16 偏移上限 65535" % len(pool))
-    scale_total = sum(len(blobs[s]) for s in tensors)
+    scale_total = sum(len(blobs[s]) for s in tensors if s in blobs)
     state_total = state_bytes(d) * d["NM_N_LAYER"]
 
-    head = ["/* 自动生成，请勿手改：infer/c/gen_weights.py",
+    head = ["/* 自动生成，请勿手改：infer/c/tools/gen_weights.py",
             " *",
             " * 权重来源：infer/model_weights.h（train/scripts/export_int8.py 从 checkpoint 导出）",
             " * 模型：%d 层 RWKV-7 x070 缩维，n_embd=%d，n_head=%d，head_size=%d，"
@@ -368,6 +383,10 @@ def main():
             " *",
             " * 导出的权重（名字 = 训练侧参数名；字节数 = int8 码 / scale 表）："]
     for sym in tensors:
+        if sym in ENGINE_UNREACHABLE:
+            head.append(" *   %-32s      -           -  (第 0 层不做 value 残差，引擎读不到，不导出)"
+                        % display_name(sym))
+            continue
         if is_array.get(sym + "_mul", False):
             rows = lens[sym + "_mul"]
             kind = "per-row %d x %d" % (rows, lens[sym] // rows)

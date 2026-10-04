@@ -12,6 +12,10 @@
 import argparse
 import json
 import pathlib
+
+# UI 文本（tps:、数字、小数点）和用户敲的英文都得画得出来，所以可打印 ASCII 0x20..0x7E 无条件优先收录；
+# 少了它们屏上就是一排兜底方框。预算不够时被挤掉的是最冷门的语料字符，不是它们。
+ASCII_REQUIRED = tuple(range(0x20, 0x7F))
 from collections import Counter
 
 CELL = 8                      # 8x8 点阵
@@ -94,7 +98,7 @@ def packed(cell):
 def packed_size(n):
     """输入：字数；输出：点阵位流占的字节数。
 
-    预期行为：与 infer/c/gen_font.py 的 pack_glyphs 同一口径 —— 每字 GLYPH_BITS 位紧密打包、
+    预期行为：与 infer/c/tools/gen_font.py 的 pack_glyphs 同一口径 —— 每字 GLYPH_BITS 位紧密打包、
               向上取整到字节，表尾再补 1 个 0 字节当 C 侧解包的哨兵。所以这是字库在 Flash 里的真实占用。
     """
     return (n * GLYPH_BITS + 7) // 8 + 1
@@ -131,23 +135,33 @@ def bot_chars(corpus):
     return cnt
 
 
-def select(freq, glyphs, ascent, budget):
-    """按词频降序选字，装到预算装不下为止。
+def select(freq, glyphs, ascent, budget, required=()):
+    """`required` 里的码点无条件优先收录，其余按语料词频降序填，装不下为止。
 
-    输入：字符 Counter、BDF 字形表、ascent、字节上限。
+    输入：字符 Counter、BDF 字形表、ascent、字节上限、必须收录的码点。
     输出：(选中的 [(码点, 7 字节)] 按码点升序, 因为缺字形或超预算而放弃的字符列表)。
-    预期行为：每加一个字都重算码点表长度，保证「点阵 + 码点表」一起不超预算。
+    预期行为：每加一个字都重算码点表长度，保证「点阵 + 码点表」一起不超预算；
+              先收 required 再收词频高的，所以预算不够时被挤掉的是最冷门的语料字符。
     """
     chosen, skipped, missing = [], [], []
+    order, seen = [], set()
+    for cp in required:
+        if cp not in seen:
+            seen.add(cp)
+            order.append(cp)
     for ch, _ in freq.most_common():
-        cp = ord(ch)
+        if ord(ch) not in seen:
+            seen.add(ord(ch))
+            order.append(ord(ch))
+
+    for cp in order:
         if cp not in glyphs:
-            missing.append(ch)
+            missing.append(chr(cp))
             continue
         blob = packed(to_cell(*glyphs[cp], ascent))
         cps = sorted([c for c, _ in chosen] + [cp])
         if packed_size(len(cps)) + varint_size(cps) > budget:
-            skipped.append(ch)
+            skipped.append(chr(cp))
             continue
         chosen.append((cp, blob))
     chosen.sort(key=lambda item: item[0])
@@ -163,9 +177,9 @@ def main():
     ap.add_argument("--corpus", type=pathlib.Path,
                     default=pathlib.Path("train/data/chitchat_para.jsonl"))
     ap.add_argument("--out", type=pathlib.Path, default=pathlib.Path("infer/font/subset_8x8.txt"))
-    ap.add_argument("--budget", type=int, default=5078,
-                    help="点阵（打包后）+ 码点表的字节上限。默认 5078 = 当前上板固件给字库的额度"
-                         "（整机 63,502 B / 64 KiB 余 2,034 B，加上字库现有 3,044 B；查表代码另占）")
+    ap.add_argument("--budget", type=int, default=5240,
+                    help="点阵（打包后）+ 码点表的字节上限。默认 5240 = 当前上板固件给字库的额度"
+                         "（整机 Flash 65,266 B，64 KiB 余 270 B；查表代码另占 380 B）")
     args = ap.parse_args()
 
     ascent, glyphs = None, {}
@@ -181,7 +195,7 @@ def main():
         glyphs.update(g)
 
     freq = bot_chars(args.corpus)
-    chosen, skipped, missing = select(freq, glyphs, ascent, args.budget)
+    chosen, skipped, missing = select(freq, glyphs, ascent, args.budget, ASCII_REQUIRED)
     if not chosen:
         raise SystemExit("一个字都没选中，预算太小？")
     cps = [cp for cp, _ in chosen]
@@ -191,10 +205,11 @@ def main():
     lines = [
         "# nanomeow 8x8 子集字库（自动生成，请勿手改）：infer/font/select_subset.py",
         "# 来源：fusion-pixel-font 8px 等宽 zh_hans + latin（OFL-1.1），见同目录 LICENSE-OFL.txt",
-        "# 选字：%s 的 bot 侧字符，按词频降序，字节上限 %d（点阵按 %d 位/字打包后的实际占用）"
-        % (args.corpus.as_posix(), args.budget, GLYPH_BITS),
+        "# 选字：可打印 ASCII 0x20..0x7E 无条件收录，其余取 %s 的 bot 侧字符按词频降序，"
+        % args.corpus.as_posix(),
+        "#       字节上限 %d（点阵按 %d 位/字打包后的实际占用）" % (args.budget, GLYPH_BITS),
         "# 点阵：每字 7 行（原字体第 0 行与第 7 列恒空，不存），行内 bit7..bit1 是第 0..6 列",
-        "# 每行：<码点十六进制> <7 行点阵十六进制> <字符>",
+        "# 每行：<码点十六进制> <7 行点阵十六进制> <字符>（解析时按前两个空格切，空格字符自己也在表里）",
         "# 收录 %d 字 / %d 字节（打包后；本表原样是 %d 字节）；因超预算放弃 %d 字；因 BDF 缺字形放弃 %d 字"
         % (len(chosen), total, raw, len(skipped), len(missing)),
     ]
@@ -208,7 +223,8 @@ def main():
     for line in args.out.read_text(encoding="utf-8").splitlines():
         if line.startswith("#"):
             continue
-        cp_hex, blob_hex, _ = line.split(" ")
+        # maxsplit=2：空格字符（0x20）自己就是分隔符，不限次数会切出第四段。
+        cp_hex, blob_hex, _ = line.split(" ", 2)
         back[int(cp_hex, 16)] = bytes.fromhex(blob_hex)
     if back != dict(chosen):
         raise SystemExit("自检失败：%s 回读结果与内存里不一致" % args.out)

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from src.wkv7 import run_wkv7, wkv7_chunked
-from src.wkv7_cuda import wkv7_cuda
+from src.wkv7 import wkv7_cuda
 
 
 def naive_wkv7(w, q, k, v, a, b):

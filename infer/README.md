@@ -8,22 +8,25 @@
 
 | 路径 | 内容 |
 |---|---|
-| `c/nanomeow.c` | 前向与 wkv7 递推（纯整数） |
-| `c/nm_fixed.h` | 定点算术：scale 的 (int32 乘子, int8 移位) 表示、四舍六入五成双、u128 中间量 |
-| `c/nm_lut.h` | exp / log1p 的 Q15 查表 |
-| `c/nm_gen.c` | 贪心生成、整数重复惩罚、`<ETX>`(0x03) 停止 |
-| `c/nm_utf8.h` | 增量 UTF-8 解码，不吐半截序列 |
-| `c/nm_weights.c` | 权重描述表，由 `gen_weights.py` 生成 |
-| `c/nm_font.c` / `c/nm_font.h` | 8x8 子集字库与查表，由 `gen_font.py` 生成 |
-| `c/nm_oled.c` / `c/nm_oled.h` | SSD1306 128x64 显示层：帧缓冲、8x8 字形渲染、按脏页刷新 |
-| `c/nm_oled_port.c` / `c/nm_stm32f103.h` | 上板移植层：PB6/PB7 软件 I2C 与最小寄存器表 |
-| `c/nm_fw.c` | 上板固件入口：72 MHz 时钟 + USART1 收行 + OLED 显示 |
+| `c/engine/nanomeow.c` | 前向与 wkv7 递推（纯整数） |
+| `c/engine/nm_fixed.h` | 定点算术：scale 的 (int32 乘子, int8 移位) 表示、四舍六入五成双、u128 中间量 |
+| `c/generated/nm_lut.h` | exp / log1p 的 Q15 查表 |
+| `c/engine/nm_gen.c` | 贪心生成、整数重复惩罚、`<ETX>`(0x03) 停止 |
+| `c/engine/nm_utf8.h` | 增量 UTF-8 解码，不吐半截序列 |
+| `c/generated/nm_weights.c` | 权重描述表，由 `gen_weights.py` 生成 |
+| `c/generated/nm_font.c` / `c/generated/nm_font.h` | 8x8 子集字库与查表，由 `gen_font.py` 生成 |
+| `c/display/nm_oled.c` / `c/display/nm_oled.h` | SSD1306 128x64 显示层：帧缓冲、8x8 字形渲染、按脏页刷新；最后一页留给固定状态行（tps） |
+| `c/display/nm_oled_port.c` / `c/platform/nm_stm32f103.h` | 上板移植层：软件 I2C 与最小寄存器表（引脚从 `nm_board.h` 取，默认 PB6/PB7） |
+| `c/platform/nm_board.h` | 板级默认值（SCL / SDA 引脚、USART1 的 BRR）；工程定义 `NM_BOARD_CONFIG` 时先读工程那份 |
+| `keil_demo/User/main.c` | 上板固件入口：72 MHz 时钟 + USART1 收行 + OLED 显示（正文区 + 右下角常驻 tps）；clang 链路自带向量表 |
+| `keil_demo/` | Keil MDK 工程：`Project.uvprojx`、`Start/startup_nanomeow.s`、`nanomeow.sct`、`User/config.h`（唯一改线处） |
 | `firmware/` | 上板构建：`m3.ld`（64K/20K 链接脚本）、`build_firmware.py`（交叉编译 + 段账本 + 闸门）、`arm_inc/`（freestanding 下的 `string.h` 桩） |
 | `font/` | 字库来源说明、选字脚本 `select_subset.py`、选字清单与许可原件 |
-| `c/nm_bench.c` | 主机吞吐基准：只量 `nm_forward_token` 的周期/token（CMake 目标 `nm_bench`） |
+| `c/host/nm_bench.c` | 主机吞吐基准：只量 `nm_forward_token` 的周期/token（CMake 目标 `nm_bench`） |
 | `firmware/arm_instcount.py` | 目标 ISA 静态账本：用上板同一套 CFLAGS 编成汇编，数每函数指令条数 |
 | `firmware/arm_linecost.py` | 目标 ISA 动态账本：gcov 行执行次数 x clang `.loc` 行指令数，估每 token 每函数指令条数 |
-| `c/*_selftest.c` | 定点内核 / UTF-8 解码器 / 引擎对拍三个自检 |
+| `firmware/oled_view.py` | OLED 可视化模拟：在 Cortex-M3 模拟器里真跑固件，把软件 I2C 位流还原成屏上字符画 |
+| `c/selftest/*_selftest.c` | 定点内核 / UTF-8 解码器 / 引擎 / 字库 / OLED 五个自检 |
 | `model_weights.h`、`model_cfg.h` | 导出产物：int8 码 + 每条 scale 的 (乘子, 移位) |
 | `ref/` | Python 定点参考实现，C 引擎与它逐位对拍 |
 | `tests/` | G1（逐位一致）/ G2（困惑度退化）闸门 |
@@ -32,7 +35,7 @@
 
 ```powershell
 .\.venv\Scripts\python.exe train\scripts\export_int8.py --ckpt train\out\<run>\sft.pth --out infer\model_weights.h
-.\.venv\Scripts\python.exe infer\c\gen_weights.py
+.\.venv\Scripts\python.exe infer\c\tools\gen_weights.py
 ```
 
 ## 构建与运行
@@ -47,15 +50,18 @@ cmake --build build\infer
 不用 cmake 时等价的一行：
 
 ```powershell
-gcc -std=c99 -O2 -Wall -Wextra -Werror -I infer/c -o nm_chat.exe infer/c/nm_chat.c infer/c/nm_gen.c infer/c/nanomeow.c infer/c/nm_weights.c infer/c/nm_font.c
+gcc -std=c99 -O2 -Wall -Wextra -Werror -I infer/c -I infer/c/engine -I infer/c/generated -I infer/c/display -I infer/c/platform -o nm_chat.exe infer/c/host/nm_chat.c infer/c/engine/nm_gen.c infer/c/engine/nanomeow.c infer/c/generated/nm_weights.c infer/c/generated/nm_font.c
 ```
 
-上板：`c/nm_fw.c` 就是能直接烧的固件入口（自带复位向量与中断向量表），它把系统时钟配到
-72 MHz（HSE 8 MHz × 9）、开 USART1（PA9/PA10，115200 8N1）、点 SSD1306，然后循环
-「显示 `user:` → 收一行 → 拼 `user:<内容>\nbot:` → 生成 → 边生成边把字符刷到屏上」，
-同一份字节也回显到串口。OLED 走 PB6 = SCL、PB7 = SDA 的软件 I2C（开漏，~400 kHz）。
-把它和 `nanomeow.c` / `nm_gen.c` / `nm_weights.c` / `nm_font.c` / `nm_oled.c` / `nm_oled_port.c`
-一起编进去即可；只想自己接管显示的话，实现一个 `nm_oled_bus_write` 就能复用整个显示层。
+上板入口是 `keil_demo/User/main.c`：它把系统时钟配到 72 MHz（HSE 8 MHz × 9）、开 USART1
+（PA9/PA10，115200 8N1）、点 SSD1306，然后循环「显示 `user:` → 收一行 → 拼
+`user:<内容>\nbot:` → 生成 → 边生成边把字符刷到屏上」，同一份字节也回显到串口，每轮生成完
+在屏上显示这次的 tps。OLED 走软件 I2C（开漏，~400 kHz），**引脚和波特率只改
+`keil_demo/User/config.h`**（工程用 `-DNM_BOARD_CONFIG="config.h"` 把它交给 `nm_board.h`；
+引擎自带默认 PB6 = SCL、PB7 = SDA）。两条链路共用这份入口：Keil 侧向量表由
+`keil_demo/Start/startup_nanomeow.s` 提供（宏 `NM_VECTORS_IN_STARTUP`），clang 侧没有 startup
+文件，由 `main.c` 自带向量表与 `Reset_Handler`。只想自己接管显示的话，实现一个
+`nm_oled_bus_write` 就能复用整个显示层。
 
 上板构建一条命令（链接脚本与闸门都在仓库里，交叉编译器默认取 PATH 上的 clang / zig，取不到再退回 msys2 ucrt64 与本机 ziglang）：
 
@@ -77,28 +83,41 @@ gcc -std=c99 -O2 -Wall -Wextra -Werror -I infer/c -o nm_chat.exe infer/c/nm_chat
 
 ## 资源账本（Cortex-M3，clang -Oz，真编译真链接）
 
-上板入口是 `c/nm_fw.c` 的 `Reset_Handler`（自带中断向量表，不靠 `-u`），账本由上面那条
-`build_firmware.py` 打出。
+账本由上面那条 `build_firmware.py` 打出（clang 链路，向量表在 `main.c` 里，不靠 `-u`）。
 
 | 目标文件 | .text | .rodata | .bss（RAM） |
 |---|---|---|---|
 | nanomeow.o（前向 + wkv7 + 定点底座） | 9,238 | 128 | 9,545 |
 | nm_gen.o（贪心生成 / 重复惩罚 / 停止） | 800 | 0 | 1,280 |
-| nm_weights.o（权重池 + 描述符） | 0 | 47,459 | 0 |
+| nm_weights.o（权重池 + 描述符） | 0 | 47,007 | 0 |
 | nm_font.o（8x8 字库） | 380 | 5,038 | 0 |
-| nm_oled.o（SSD1306 显示层） | 1,010 | 25 | 1,036 |
-| nm_oled_port.o（软件 I2C） | 266 | 0 | 0 |
-| nm_fw.o（时钟 / 串口 / 主循环） | 434 | 42 | 3,900 |
+| nm_oled.o（SSD1306 显示层） | 1,064 | 25 | 1,036 |
+| nm_oled_port.o（软件 I2C） | 286 | 0 | 0 |
+| main.o（时钟 / 串口 / 主循环 + 向量表） | 666 | 43 | 3,904 |
 
 整机（链接后按程序头统计，含启动代码、`memcpy` / `memset` 与 64 位整数辅助函数）：
 
 | 段 | 字节 |
 |---|---|
 | .isr_vector | 192 |
-| .text | 12,602 |
-| .rodata | 52,696 |
-| **Flash 合计** | **65,490 = 63.96 KiB（64 KiB 余 46 B）** |
-| .bss（RAM） | 15,768 = 15.40 KiB（20 KiB 余 4,712 B） |
+| .text | 12,638 |
+| .rodata | 52,436 |
+| **Flash 合计** | **65,266 = 63.74 KiB（64 KiB 余 270 B）** |
+| .bss（RAM） | 15,772 = 15.40 KiB（20 KiB 余 4,708 B） |
+
+同一条链路用 **Keil MDK（armclang 6.7 + microlib + LTO + scatter `keil_demo/nanomeow.sct`）**
+编出来（`UV4 -b keil_demo/Project.uvprojx`，0 Error / 0 Warning）：
+
+| 项 | 字节 |
+|---|---|
+| Code | 12,956 |
+| RO-data | 52,480 |
+| **Flash 合计** | **65,436 = 63.90 KiB（64 KiB 余 116 B）** |
+| RW-data + ZI-data（RAM） | 16,280 = 15.90 KiB（20 KiB 余 4,200 B） |
+
+两条链路是同一份权重、同一套源码：Keil 侧比 clang 侧多 170 B（microlib 的启动与库辅助代码
+`memcpy` / `memset` / 64 位除法与移位），余量因此从 270 B 降到 116 B；这 170 B 由「第 0 层
+`v0/v1/v2` 不导出」腾出的 452 B（见下节）覆盖。
 
 无浮点复核查的是**各目标文件的未定义符号**，不是链接产物 —— lld 出来的 ELF 没有符号表，
 在它上面查永远是「无」。实测只有 `memcpy` / `memset` 与整数辅助
@@ -111,15 +130,20 @@ gcc -std=c99 -O2 -Wall -Wextra -Werror -I infer/c -o nm_chat.exe infer/c/nm_chat
 三项把权重从 49,428 B 压到 46,587 B。`infer/tests/test_weights_pack.py` 会把池反解回来与
 `model_weights.h` 的原始 mul / shift / 码逐位对拍，不需要 checkpoint。
 
+**另有 452 B 是引擎永远读不到的**：第 0 层不做 value 残差（`nanomeow.c` 的 `if (layer == 0)`
+直接拷 `v_first`，参考实现 `Mini_RWKV_7` 同样跳过），它的 `blocks.0.att.v0 / v1 / v2`
+（36 + 58 + 358 B）`gen_weights.py` 直接不导出、描述符写 `{0, 0, 0, 0, 0, 0}`。这是**删掉
+读不到的数据**，不是砍架构 —— `test_weights_pack.py` 有闸门守着「只有这三个允许留空」。
+
 **权重码没有再压的余地（实测，可复现）**：整块 `nm_pool[]` 46,587 B 的字节熵是 7.809 bit/byte
 （均匀 8.0），理论下限只到 45,477 B（省 2.4%）；拿通用压缩器压整块，`zlib -9` 得 43,560 B（6.50%）、
 `lzma` 得 43,052 B（7.59%）。省下的这 3.5 KB 要靠解压换，而前向每个 token 都会把所有张量读一遍，
 等于每 token 多跑一次全池解压 —— 收益远小于代价，所以 41 KB 的 int8 码按原样存。
 （复现：把 `nm_weights.c` 里 `nm_pool` 的字节抠出来量熵 / 丢给 zlib 即可，不需要 checkpoint。）
 
-**字库是全量 701 字**：语料 bot 侧的 701 个不同字符一个不少。点阵每字只存 7 行 x 7 列
-（原字体第 0 行与第 7 列恒空）= 49 位，再紧密打包成位流，所以 701 字只占 4,295 B；
-码点表 736 B；查表代码 380 B。取舍与方框率见 `font/README.md`。
+**字库是 730 字**：可打印 ASCII 95 个无条件收录，中文按语料词频取到字节上限（730 - 95 = 635 个，
+语料字符覆盖 98.72%）。点阵每字只存 7 行 x 7 列（原字体第 0 行与第 7 列恒空）= 49 位，
+再紧密打包成位流，所以 730 字只占 4,473 B；码点表 766 B；查表代码 380 B。取舍见 `font/README.md`。
 
 工具链会影响结果：zig 自己的代码生成明显差（实测 zig -Oz 单目标 14,190 B vs clang -Oz 9,640 B），
 所以本机用「clang 编 + zig 的 lld 链」而不是 `zig cc` 一键编链；上板前最好再用
@@ -137,7 +161,7 @@ build\infer\nm_bench.exe 20000                              # 主机口径：周
 .\.venv\Scripts\python.exe infer\firmware\arm_linecost.py    # 目标 ISA 动态口径：每 token 每函数指令条数（估算）
 ```
 
-**主机口径**（`c/nm_bench.c`，只调 `nm_forward_token`，不碰生成路径）：用 `QueryThreadCycleTime`
+**主机口径**（`c/host/nm_bench.c`，只调 `nm_forward_token`，不碰生成路径）：用 `QueryThreadCycleTime`
 只数本线程真正跑掉的周期，同一二进制重复跑抖动 < 1%（墙钟口径实测两次能差 14%，已弃用）。
 i9-12900HX 上实测三次 **308,972 / 312,639 / 309,588 cycles/token**（≈ 31 万），
 全程 `nm_range_error == 0`（引擎的溢出计数，非 0 就说明中间量饱和、结果不可信）。
@@ -186,6 +210,6 @@ i9-12900HX 上实测三次 **308,972 / 312,639 / 309,588 cycles/token**（≈ 31
 | 奈奈是谁 | 奈奈是主人的猫娘小助手，会一直陪在主人身边喵 |
 | 你叫什么名字 | 奈奈是主人的猫娘小助手，会一直陪在主人身边喵 |
 
-演示 20 条问答的输出**零乱码、零方框**（字库现在是全量 701 字）；38 条演示/泛化输出共 735 字符里
-还剩 17 个方框（2.31%），全是模型跑飞时吐的**语料外**字符（`✉䜈丆享兌含坸戩攀槠聜裉蹸躬辜酌龼`），
-全量字库也覆盖不到，所以 OLED 上兜底方框无论如何都要有。
+字库现在覆盖语料字符的 **98.72%**（按出现次数；挤掉的是 66 个最冷门的字）。上面这张演示表里就有
+8 个字（`亲住埋怀掖角诶跑`）落在字库外，OLED 上会画兜底方框；模型跑飞时吐的语料外字符
+（`✉䜈丆享兌含坸戩攀槠聜裉蹸躬辜酌龼`）同样落到它身上 —— 兜底字形无论如何都要有。

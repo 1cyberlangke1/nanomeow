@@ -1,6 +1,6 @@
 """无损压缩闸门：把 nm_weights.c 里的权重池反解回来，必须与 model_weights.h 逐位相同。
 
-输入：infer/model_weights.h（原始 mul/shift/码）、infer/c/nm_weights.c（压缩后的权重池与描述符）。
+输入：infer/model_weights.h（原始 mul/shift/码）、infer/c/generated/nm_weights.c（压缩后的权重池与描述符）。
 输出：pytest 断言 —— 每个张量每一行的 (mul, shift) 与每个 int8 码都还原得一模一样。
 预期行为：这条用例不需要 checkpoint，纯粹验证「编码 → 解码」是无损的；端到端的
           数值正确性由 test_c_engine.py 的 G1 闸门对拍独立的 Python 定点参考。
@@ -14,13 +14,20 @@ import re
 HERE = pathlib.Path(__file__).resolve()
 C_DIR = HERE.parents[1] / "c"
 HEADER = HERE.parents[1] / "model_weights.h"
-GENERATED = C_DIR / "nm_weights.c"
+GENERATED = C_DIR / "generated" / "nm_weights.c"
 
 # 带 /* nmw_xxx */ 尾注释的描述符才是真实张量；层 1/2 的 ln0 是空占位，没有注释。
 DESC_RE = re.compile(
     r"\{\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*\}"
     r"[\s,;]*/\*\s*(nmw_\w+)\s*\*/")
 POOL_RE = re.compile(r"const uint8_t nm_pool\[(\d+)\] = \{([^{}]*)\};")
+
+# 引擎在 layer == 0 时不读 value 残差的 v0 / v1 / v2（infer/c/tools/gen_weights.py 里有同名集合，
+# 依据是 nanomeow.c 的 `if (layer == 0)` 分支与 infer/ref/model.py 的 `if i == 0`），
+# 这三个张量的描述符留空、码与 scale 不进池 —— 别的张量一个字节都不许少。
+ENGINE_UNREACHABLE = frozenset((
+    "nmw_blocks_0_att_v0", "nmw_blocks_0_att_v1", "nmw_blocks_0_att_v2",
+))
 
 
 def int_list(text, sym):
@@ -98,13 +105,20 @@ def parse_generated():
 
 
 def test_scale_and_codes_roundtrip_is_lossless():
-    """输入：无；输出：无。预期行为：105 个张量全部逐位还原，且没有漏掉任何一个描述符。"""
+    """输入：无；输出：无。预期行为：105 个描述符里的张量全部逐位还原；
+    引擎读不到的第 0 层 v0/v1/v2（value 残差，`if (layer == 0)` 分支不读）描述符必须留空，
+    且**只有**这三个可以留空 —— 别的张量少一个字节都算丢数据。"""
     header = HEADER.read_text(encoding="utf-8")
     pool, descs = parse_generated()
     assert len(descs) == 105, "描述符个数不对：%d" % len(descs)
     assert len({d[6] for d in descs}) == 105, "描述符符号有重复"
 
     for code_off, scale_off, rows, cols, per_row, idx_bits, sym in descs:
+        if sym in ENGINE_UNREACHABLE:
+            assert (code_off, scale_off, rows, cols, per_row, idx_bits) == (0, 0, 0, 0, 0, 0), \
+                "%s 是引擎读不到的张量，描述符应该留空" % sym
+            continue
+        assert rows > 0 and cols > 0, "%s 不是引擎读不到的张量，描述符不该留空" % sym
         assert code_off <= scale_off <= len(pool), "%s 的偏移越界" % sym
         # 池是 uint8_t，权重码按 int8 存，先补符号位再反解
         codes = [b - 256 if b >= 128 else b for b in pool[code_off:scale_off]]
@@ -122,6 +136,13 @@ def test_scale_and_codes_roundtrip_is_lossless():
         assert muls == orig_muls, "%s 的 mul 还原不一致" % sym
         assert shifts == orig_shifts, "%s 的 shift 还原不一致" % sym
         assert codes == orig_codes, "%s 的 int8 码还原不一致" % sym
+
+
+def test_only_engine_unreachable_tensors_are_skipped():
+    """输入：无；输出：无。预期行为：留空描述符的张量集合恰好等于 gen_weights.py 声明的三个。"""
+    _, descs = parse_generated()
+    skipped = {d[6] for d in descs if d[2] == 0 or d[3] == 0}
+    assert skipped == ENGINE_UNREACHABLE, "留空的张量集合不对：%s" % sorted(skipped)
 
 
 def test_generated_sizes_are_compressed():

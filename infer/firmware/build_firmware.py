@@ -26,24 +26,33 @@ ROOT = FW_DIR.parents[1]
 FLASH_BASE, FLASH_SIZE = 0x08000000, 64 * 1024
 RAM_BASE, RAM_SIZE = 0x20000000, 20 * 1024
 
-# 固件源码：引擎 + 权重表 + 生成/停止 + 字库 + OLED 协议层 + 软件 I2C + 串口入口。
+# 固件源码：引擎 + 权重表 + 生成/停止 + 字库 + OLED 协议层 + 软件 I2C + 板级入口。
 # 自检程序（*_selftest.c）与主机 CLI（nm_chat.c）不上板，不在此列。
+# 板级入口就是 Keil 工程里的 keil_demo/User/main.c —— 两条构建路径共用同一份入口，
+# 差别只在 Keil 由 startup_nanomeow.s 提供向量表（-DNM_VECTORS_IN_STARTUP）。
 SOURCES = [
-    "infer/c/nanomeow.c",
-    "infer/c/nm_gen.c",
-    "infer/c/nm_weights.c",
-    "infer/c/nm_font.c",
-    "infer/c/nm_oled.c",
-    "infer/c/nm_oled_port.c",
-    "infer/c/nm_fw.c",
+    "infer/c/engine/nanomeow.c",
+    "infer/c/engine/nm_gen.c",
+    "infer/c/generated/nm_weights.c",
+    "infer/c/generated/nm_font.c",
+    "infer/c/display/nm_oled.c",
+    "infer/c/display/nm_oled_port.c",
+    "keil_demo/User/main.c",
 ]
 
-INCLUDES = ["infer/c", "infer", "infer/firmware/arm_inc"]
+# 头文件按功能分散在 infer/c 的子目录里，编译时逐个加 -I。
+INCLUDES = ["infer/c", "infer/c/engine", "infer/c/generated", "infer/c/display",
+            "infer/c/platform", "infer", "keil_demo/User", "infer/firmware/arm_inc"]
 
 CFLAGS = [
     "--target=armv7m-none-eabi", "-mthumb", "-mcpu=cortex-m3", "-Oz",
     "-ffreestanding", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
-    "-fno-common", "-std=c99", "-Wall", "-Wextra", "-c",
+    "-fno-common", "-std=c99", "-Wall", "-Wextra",
+    # 板级接线（OLED 引脚 / 波特率）以工程里的 config.h 为准，引擎自带一份默认值兜底。
+    '-DNM_BOARD_CONFIG=\"config.h\"',
+    # 上板不需要重复惩罚（恒为 1.0），编掉生成路径的历史表省 1 KB RAM；与 Keil 工程 MiscControls 同口径。
+    "-DNM_GEN_NO_REP_PENALTY",
+    "-c",
     # 每个函数 / 数据各自成段，链接期的 --gc-sections 才真的能丢没用到的代码；
     # 没有这两项时每个 .o 只有一个大 .text，--gc-sections 等于空转。
     "-ffunction-sections", "-fdata-sections",

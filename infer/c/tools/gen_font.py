@@ -1,7 +1,7 @@
-"""从 infer/font/subset_8x8.txt 生成 C 引擎的字库 infer/c/nm_font.c 与 nm_font.h。
+"""从 infer/font/subset_8x8.txt 生成 C 引擎的字库 infer/c/generated/nm_font.c 与 nm_font.h。
 
 输入：infer/font/subset_8x8.txt（每行「码点 7 行点阵 字符」，由 infer/font/select_subset.py 选出来）。
-输出：infer/c/nm_font.h（常量与查表接口）与 infer/c/nm_font.c（码点表 + 打包点阵 + 兜底字形 + 查表实现）。
+输出：infer/c/generated/nm_font.h（常量与查表接口）与 infer/c/generated/nm_font.c（码点表 + 打包点阵 + 兜底字形 + 查表实现）。
 预期行为：码点按升序存成「首个绝对 + 之后增量」的 LEB128 流，顺序扫描即可二分退化成线性；
           点阵按「每字 NM_FONT_ROW * NM_FONT_INK = 49 位」紧密打包成位流 —— 每行只取 bit7..bit1
           （第 7 列恒空，不存）7 位、MSB 在前依次写入；表尾补 1 个 0 字节，因为 C 侧解包固定读
@@ -13,9 +13,9 @@
 import pathlib
 
 HERE = pathlib.Path(__file__).resolve().parent
-SUBSET = HERE.parent / "font" / "subset_8x8.txt"
-OUT_C = HERE / "nm_font.c"
-OUT_H = HERE / "nm_font.h"
+SUBSET = HERE.parents[1] / "font" / "subset_8x8.txt"
+OUT_C = HERE.parent / "generated" / "nm_font.c"
+OUT_H = HERE.parent / "generated" / "nm_font.h"
 
 CELL = 8          # 8x8 点阵
 ROW_BYTES = 7     # 只存第 1..7 行：原字体第 0 行恒空
@@ -38,7 +38,8 @@ def read_subset(path):
     for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line or line.startswith("#"):
             continue
-        parts = line.split(" ")
+        # maxsplit=2：空格字符（0x20）自己就是分隔符，不限次数会切出第四段。
+        parts = line.split(" ", 2)
         if len(parts) != 3:
             raise SystemExit("自检失败：%s:%d 不是三段" % (path.name, lineno))
         cp = int(parts[0], 16)
@@ -144,7 +145,7 @@ def parse_cp_back(cp_bytes, n):
 def write_header(n, cp_bytes, packed):
     """输入：字数、码点表、点阵位流；输出：无。预期行为：常量全部由实际数据算出来。"""
     with OUT_H.open("w", encoding="utf-8", newline="\n") as fh:
-        fh.write("/* 自动生成，请勿手改：infer/c/gen_font.py */\n")
+        fh.write("/* 自动生成，请勿手改：infer/c/tools/gen_font.py */\n")
         fh.write("#ifndef NANOMEOW_FONT_H\n#define NANOMEOW_FONT_H\n\n#include <stdint.h>\n\n")
         fh.write("#define NM_FONT_N %d          /* 收录字符数 */\n" % n)
         fh.write("#define NM_FONT_CP_BYTES %d   /* 码点表字节数 */\n" % len(cp_bytes))
@@ -178,7 +179,7 @@ void nm_font_glyph_utf8(const uint8_t *s, int n, uint8_t *out);
 def write_source(n, cp_bytes, packed):
     """输入：字数、码点表、点阵位流；输出：无。预期行为：C 查表实现与 Python 打包口径互逆。"""
     with OUT_C.open("w", encoding="utf-8", newline="\n") as fh:
-        fh.write("/* 自动生成，请勿手改：infer/c/gen_font.py\n")
+        fh.write("/* 自动生成，请勿手改：infer/c/tools/gen_font.py\n")
         fh.write(" * nanomeow 的 8x8 子集字库：%d 字，点阵 %d B（打包） + 码点表 %d B = %d B。\n"
                  % (n, len(packed), len(cp_bytes), len(packed) + len(cp_bytes)))
         fh.write(" * 字形来源：fusion-pixel-font 8px 等宽（OFL-1.1）；选字清单与来源说明见\n")
@@ -251,7 +252,7 @@ void nm_font_glyph_utf8(const uint8_t *s, int n, uint8_t *out)
 
 
 def main():
-    """输入：无；输出：infer/c/nm_font.h 与 nm_font.c。预期行为：写完回读比对。"""
+    """输入：无；输出：infer/c/generated/nm_font.h 与 nm_font.c。预期行为：写完回读比对。"""
     glyphs = read_subset(SUBSET)
     n = len(glyphs)
     cp_bytes = build_cp_table(glyphs)

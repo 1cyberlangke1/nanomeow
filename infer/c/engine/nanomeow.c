@@ -3,8 +3,9 @@
  * 全部运算只有整数：权重 int8、激活 int8 + 一个 scale、wkv state 是 int32
  * （单位 = 写它那一趟 token 的 s_k * s_v）。没有一处浮点。
  *
- * 工作区说明：模型层的张量用文件级 static 暂存（`s_*`），栈上只留叶子函数的小数组。
- * 这样栈深度不随层数增长，RAM 占用是一个固定、可量的数（激活 64 位暂存是为了与 Python
+ * 工作区说明：模型层的张量用文件级 static 暂存（`s_*`），叶子算子的 int64 工作数组也共用
+ * 一块文件级暂存，栈上只剩标量。这样栈深度不随层数增长，RAM 占用是一个固定、可量的数
+ * （激活 64 位暂存是为了与 Python
  * 的大整数语义逐位对齐；上板按 §10 账本换成 32 位时，这一块的数字要重算）。
  */
 #include <limits.h>
@@ -24,7 +25,7 @@ static int s_lut_ready;
 /* 输入：输出缓冲、表长 n、初值 v0、首差 d0、二阶差基值 lo、每步 2 bit 的位流 dd。
  * 输出：无（就地填满 out 的前 n 项）。
  * 预期行为：out[0] = v0；之后 v += d，d 从第 2 步起每步加 (lo + 位流字段)；
- *           与 infer/c/gen_lut.py 的 encode / pack 互逆，解出的表逐项等于 Python 参考。 */
+ *           与 infer/c/tools/gen_lut.py 的 encode / pack 互逆，解出的表逐项等于 Python 参考。 */
 static void nm_lut_expand(uint16_t *out, int n, int v0, int d0, int lo, const uint32_t *dd)
 {
     int v = v0, d = d0, i;
@@ -62,6 +63,15 @@ void nm_lut_init(void)
 static int64_t s_head[NM_VOCAB];
 
 typedef struct { int64_t v[NM_MAX_DIM]; nm_scale scale; } nm_tensor;
+
+/* 叶子算子的共享工作区：这些算子互为叶子（调用图里没有互相嵌套），所以共用一块 ——
+ * 原先每个函数都在栈上开 0.5~1.6 KB 的 int64 数组，现在 .bss 里只留一份。
+ * 深度 4 是 nm_norm_q 的需求（v / wv / bv / vals）；s_wt / s_wt2 是它和 nm_addmul_param
+ * 解包权重用的张量暂存。 */
+static int64_t s_wa[NM_MAX_DIM], s_wb[NM_MAX_DIM], s_wc[NM_MAX_DIM], s_wd[NM_MAX_DIM];
+static nm_tensor s_wt, s_wt2;
+static nm_scale s_sc[NM_MAX_DIM];
+static int32_t s_xs[NM_MAX_DIM];
 
 /* ================= 张量与动态量化 ================= */
 
@@ -319,14 +329,13 @@ static int32_t nm_rsqrt_q32(int64_t x)
 static void nm_norm_q(const nm_tensor *x, const nm_mat *w, const nm_mat *b,
                       int32_t eps_q32, int groups, int n, nm_tensor *out)
 {
-    int64_t v[NM_MAX_DIM], wv[NM_MAX_DIM], bv[NM_MAX_DIM], vals[NM_MAX_DIM];
-    nm_tensor wt, bt;
+    int64_t *v = s_wa, *wv = s_wb, *bv = s_wc, *vals = s_wd;
     int size = n / groups, gi, i, k;
     nm_to_fixed(x, n, v);
-    nm_param(w, n, &wt);
-    nm_param(b, n, &bt);
-    nm_to_fixed(&wt, n, wv);
-    nm_to_fixed(&bt, n, bv);
+    nm_param(w, n, &s_wt);
+    nm_param(b, n, &s_wt2);
+    nm_to_fixed(&s_wt, n, wv);
+    nm_to_fixed(&s_wt2, n, bv);
     for (gi = 0; gi < groups; gi++) {
         int base = gi * size;
         int64_t sum = 0, acc = 0, mean, var_q32;
@@ -358,7 +367,7 @@ static void nm_neg_t(const nm_tensor *a, int n, nm_tensor *out)
 
 static void nm_add_t(const nm_tensor *a, const nm_tensor *b, int n, int quantize, nm_tensor *out)
 {
-    int64_t va[NM_MAX_DIM], vb[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *va = s_wa, *vb = s_wb, *vals = s_wc;
     int i;
     nm_to_fixed(a, n, va);
     nm_to_fixed(b, n, vb);
@@ -368,7 +377,7 @@ static void nm_add_t(const nm_tensor *a, const nm_tensor *b, int n, int quantize
 
 static void nm_sub_t(const nm_tensor *a, const nm_tensor *b, int n, int quantize, nm_tensor *out)
 {
-    int64_t va[NM_MAX_DIM], vb[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *va = s_wa, *vb = s_wb, *vals = s_wc;
     int i;
     nm_to_fixed(a, n, va);
     nm_to_fixed(b, n, vb);
@@ -380,7 +389,7 @@ static void nm_sub_t(const nm_tensor *a, const nm_tensor *b, int n, int quantize
 static void nm_add_real(const nm_tensor *a, int n, int64_t num, int64_t den, int quantize,
                         nm_tensor *out)
 {
-    int64_t va[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *va = s_wa, *vals = s_wb;
     int64_t c = nm_round_div(num * NM_ONE, den);
     int i;
     nm_to_fixed(a, n, va);
@@ -392,7 +401,7 @@ static void nm_add_real(const nm_tensor *a, int n, int64_t num, int64_t den, int
 static void nm_addmul(const nm_tensor *a, const nm_tensor *b, const nm_tensor *c, int n,
                       int quantize, nm_tensor *out)
 {
-    int64_t va[NM_MAX_DIM], vb[NM_MAX_DIM], vc[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *va = s_wa, *vb = s_wb, *vc = s_wc, *vals = s_wd;
     int i;
     nm_to_fixed(a, n, va);
     nm_to_fixed(b, n, vb);
@@ -404,7 +413,7 @@ static void nm_addmul(const nm_tensor *a, const nm_tensor *b, const nm_tensor *c
 /* 输入：张量；输出：relu(x)^2。预期行为：对应 CMix 的 `fq_act(relu(key(k)) ** 2)`。 */
 static void nm_relu_sq(const nm_tensor *x, int n, int quantize, nm_tensor *out)
 {
-    int64_t v[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *v = s_wa, *vals = s_wb;
     int i;
     nm_to_fixed(x, n, v);
     for (i = 0; i < n; i++) {
@@ -417,7 +426,7 @@ static void nm_relu_sq(const nm_tensor *x, int n, int quantize, nm_tensor *out)
 /* 输入：张量（长度 = head 数 * 每个 head 的长度）；输出：每个 head 内求和后广播回该 head。 */
 static void nm_sum_head(const nm_tensor *x, int head_size, int n, int quantize, nm_tensor *out)
 {
-    int64_t v[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *v = s_wa, *vals = s_wb;
     int base, i;
     nm_to_fixed(x, n, v);
     for (base = 0; base < n; base += head_size) {
@@ -444,7 +453,7 @@ static void nm_mul_t(const nm_tensor *a, const nm_tensor *b, int n, int quantize
 static void nm_add_mulq(const nm_tensor *a, const nm_tensor *b, const nm_tensor *c, int n,
                         int quantize, nm_tensor *out)
 {
-    int64_t va[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *va = s_wa, *vals = s_wb;
     nm_scale s = nm_mul(b->scale, c->scale);
     int i;
     nm_to_fixed(a, n, va);
@@ -460,15 +469,14 @@ static void nm_add_mulq(const nm_tensor *a, const nm_tensor *b, const nm_tensor 
 static void nm_addmul_param(const nm_tensor *a, const nm_tensor *b, const nm_mat *w, int n,
                             nm_tensor *out)
 {
-    nm_tensor wt;
-    nm_param(w, n, &wt);
-    nm_addmul(a, b, &wt, n, 1, out);
+    nm_param(w, n, &s_wt);
+    nm_addmul(a, b, &s_wt, n, 1, out);
     nm_fq(out, n);
 }
 
 static void nm_sigmoid_t(const nm_tensor *x, int n, int quantize, nm_tensor *out)
 {
-    int64_t v[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *v = s_wa, *vals = s_wb;
     int i;
     nm_to_fixed(x, n, v);
     for (i = 0; i < n; i++) vals[i] = nm_sigmoid_q((int32_t)v[i]);
@@ -477,7 +485,7 @@ static void nm_sigmoid_t(const nm_tensor *x, int n, int quantize, nm_tensor *out
 
 static void nm_tanh_t(const nm_tensor *x, int n, int quantize, nm_tensor *out)
 {
-    int64_t v[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *v = s_wa, *vals = s_wb;
     int i;
     nm_to_fixed(x, n, v);
     for (i = 0; i < n; i++) vals[i] = nm_tanh_q((int32_t)v[i]);
@@ -486,7 +494,7 @@ static void nm_tanh_t(const nm_tensor *x, int n, int quantize, nm_tensor *out)
 
 static void nm_softplus_t(const nm_tensor *x, int n, int quantize, nm_tensor *out)
 {
-    int64_t v[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *v = s_wa, *vals = s_wb;
     int i;
     nm_to_fixed(x, n, v);
     for (i = 0; i < n; i++) vals[i] = nm_softplus_q((int32_t)v[i]);
@@ -541,9 +549,9 @@ void nm_dot2_i8(const int8_t *ra, const int8_t *rb, const int32_t *xs, int n,
  *           MAX_ALIGN_SHIFT 口径），quantize=True 时再按 per-tensor 动态口径量化回 int8。 */
 static void nm_linear(const nm_tensor *x, const nm_mat *m, int quantize, nm_tensor *out)
 {
-    int64_t acc[NM_MAX_DIM], vals[NM_MAX_DIM];
-    nm_scale sc[NM_MAX_DIM];
-    int32_t xs[NM_MAX_DIM];
+    int64_t *acc = s_wa, *vals = s_wb;
+    nm_scale *sc = s_sc;
+    int32_t *xs = s_xs;
     int32_t e_ref = INT32_MAX;
     int r, j;
     /* 输入码先落成 int32：内层是 int8 x int8 的点积，用 int64 数组会退化成 64 位乘加
@@ -584,7 +592,7 @@ static void nm_head_linear(const nm_tensor *x, const nm_mat *m, int8_t *codes, n
     int64_t mx, mn;
     nm_u128 num, other;
     nm_scale base;
-    int32_t xs[NM_MAX_DIM];
+    int32_t *xs = s_xs;
     int r, j;
     for (j = 0; j < m->cols; j++) xs[j] = (int32_t)x->v[j];
     for (r = 0; r < m->rows; r++) {
@@ -632,7 +640,7 @@ static void nm_head_linear(const nm_tensor *x, const nm_mat *m, int8_t *codes, n
  *           范数为 0 的组输出全 0。 */
 static void nm_normalize_p2(const nm_tensor *x, int groups, int n, nm_tensor *out)
 {
-    int64_t v[NM_MAX_DIM], vals[NM_MAX_DIM];
+    int64_t *v = s_wa, *vals = s_wb;
     int size = n / groups, gi, i;
     nm_to_fixed(x, n, v);
     for (gi = 0; gi < groups; gi++) {
@@ -654,7 +662,7 @@ static void nm_normalize_p2(const nm_tensor *x, int groups, int n, nm_tensor *ou
 /* 输入：w_in 的张量（恒 <= -0.5）、长度；输出：Q15 衰减码 = round(exp(-exp(w_in)) * 2^15)。 */
 static void nm_decay_q15(const nm_tensor *w, int n, int32_t *w15)
 {
-    int64_t v[NM_MAX_DIM];
+    int64_t *v = s_wa;
     int i;
     nm_to_fixed(w, n, v);
     for (i = 0; i < n; i++) {
@@ -676,7 +684,7 @@ static void nm_wkv7_recurrence(const nm_tensor *q, const nm_tensor *k, const nm_
     int n_head = n / head_size;
     nm_scale step = nm_mul(k->scale, v->scale);
     nm_scale ab_scale = nm_mul(b->scale, a->scale);
-    int64_t ys[NM_MAX_DIM];
+    int64_t *ys = s_wa;
     int h, i, j;
     if (step_prev_valid) {
         nm_scale ratio = nm_div(*step_prev, step);
@@ -735,7 +743,7 @@ static void nm_att(int layer, const nm_tensor *h1, nm_tensor *v_first, int *v_fi
                    nm_layer_state *st, nm_tensor *out)
 {
     const nm_block *p = &nm_blocks[layer];
-    nm_tensor prev;
+    static nm_tensor prev;
 
     /* xx = fq(prev - x)，首 token 时 prev 视作 0 */
     if (st->att_prev_valid) {
@@ -850,7 +858,7 @@ static void nm_att(int layer, const nm_tensor *h1, nm_tensor *v_first, int *v_fi
 static void nm_ffn(int layer, const nm_tensor *h2, nm_layer_state *st, nm_tensor *out)
 {
     const nm_block *p = &nm_blocks[layer];
-    nm_tensor prev;
+    static nm_tensor prev;
     if (st->ffn_prev_valid) {
         for (int j = 0; j < NM_N_EMBD; j++) prev.v[j] = st->ffn_prev[j];
         prev.scale = st->ffn_prev_scale;
@@ -880,7 +888,7 @@ void nm_state_zero(nm_layer_state *states)
 void nm_forward_token(int token, nm_layer_state *states, int8_t *logits, nm_scale *logits_scale)
 {
     int i, j;
-    nm_tensor x, h, att_out, ffn_out, v_first;
+    static nm_tensor x, h, att_out, ffn_out, v_first;
     int v_first_valid = 0;
 
     nm_lut_init();                   /* 幂等：第一次进来把两张 Q15 表展开进 RAM */
