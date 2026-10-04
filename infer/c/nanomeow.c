@@ -56,6 +56,13 @@ static void nm_quantize_dynamic(const int64_t *vals, int n, nm_scale scale,
         return;
     }
     *out_scale = nm_div_int(nm_mul_int_u128(scale, num), NM_QUANT_DEN);
+    if (num.hi == 0 && num.lo == (uint64_t)NM_QUANT_DEN) {
+        /* num 正好等于 127*128：说明这组码已经满量程，再量化的码是精确恒等
+         * （round(v * 16256 / 16256) == v），只有 scale 要按上面那行重算一次。
+         * 本文件里 nm_fq 都是跟在 quantize=1 的算子后面，走的就是这条。 */
+        if (out != vals) memcpy(out, vals, (size_t)n * sizeof(int64_t));
+        return;
+    }
     for (i = 0; i < n; i++) {
         int64_t q = nm_requant_code_u128(vals[i], num);
         out[i] = q < -128 ? -128 : (q > 127 ? 127 : q);
@@ -409,12 +416,16 @@ static void nm_linear(const nm_tensor *x, const nm_mat *m, int quantize, nm_tens
 {
     int64_t acc[NM_MAX_DIM], vals[NM_MAX_DIM];
     nm_scale sc[NM_MAX_DIM];
+    int32_t xs[NM_MAX_DIM];
     int32_t e_ref = INT32_MAX;
     int r, j;
+    /* 输入码先落成 int32：内层是 int8 x int8 的点积，用 int64 数组会退化成 64 位乘加
+     * （Cortex-M3 上是 __aeabi_lmul 软件例程）。 */
+    for (j = 0; j < m->cols; j++) xs[j] = (int32_t)x->v[j];
     for (r = 0; r < m->rows; r++) {
         int32_t a = 0;
         const int8_t *row = m->codes + (size_t)r * m->cols;
-        for (j = 0; j < m->cols; j++) a += (int32_t)row[j] * (int32_t)x->v[j];
+        for (j = 0; j < m->cols; j++) a += (int32_t)row[j] * xs[j];
         acc[r] = a;
         sc[r] = nm_mul(nm_row_scale(m, r), x->scale);
         if (sc[r].e < e_ref) e_ref = sc[r].e;
@@ -442,7 +453,9 @@ static void nm_head_linear(const nm_tensor *x, const nm_mat *m, int8_t *codes, n
     int64_t mx, mn;
     nm_u128 num, other;
     nm_scale base;
+    int32_t xs[NM_MAX_DIM];
     int r, j;
+    for (j = 0; j < m->cols; j++) xs[j] = (int32_t)x->v[j];
     for (r = 0; r < m->rows; r++) {
         nm_scale sc = nm_mul(nm_row_scale(m, r), x->scale);
         if (sc.e < e_ref) e_ref = sc.e;
@@ -451,7 +464,7 @@ static void nm_head_linear(const nm_tensor *x, const nm_mat *m, int8_t *codes, n
         int32_t a = 0, sh;
         const int8_t *row = m->codes + (size_t)r * m->cols;
         nm_scale sc = nm_mul(nm_row_scale(m, r), x->scale);
-        for (j = 0; j < m->cols; j++) a += (int32_t)row[j] * (int32_t)x->v[j];
+        for (j = 0; j < m->cols; j++) a += (int32_t)row[j] * xs[j];
         sh = sc.e - e_ref;
         if (sh > 40) { nm_range_error = 1; sh = 40; }
         s_head[r] = nm_shl_checked((int64_t)a * sc.m, sh);

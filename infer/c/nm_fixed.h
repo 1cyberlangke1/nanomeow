@@ -30,10 +30,7 @@ extern int nm_range_error;
 
 static inline uint64_t nm_clz64(uint64_t x)
 {
-    uint64_t n = 0;
-    if (x == 0) return 64;
-    while (!(x & 0x8000000000000000ULL)) { x <<= 1; n++; }
-    return n;
+    return x == 0 ? 64u : (uint64_t)__builtin_clzll(x);
 }
 
 /* 输入：两个 uint64；输出：乘积的高 64 位与低 64 位。预期行为：按 32 位肢拆开算，不依赖 __int128。 */
@@ -51,6 +48,17 @@ static inline void nm_mul_wide(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *l
  * 预期行为：与 Python 的 divmod + 取偶一致；den 必须 > 0。 */
 static inline int64_t nm_round_div(int64_t num, int64_t den)
 {
+    if (den > 0 && (den & (den - 1)) == 0) {
+        /* den 是 2 的幂：用移位代替 64 位除法（Cortex-M3 上 __aeabi_ldivmod 上百周期）。
+         * GCC/Clang 的算术右移对负数就是 floor，补码下 num & (den-1) 正好是 num mod den
+         * 的非负余数，所以下面三个式子和通用分支逐位等价。 */
+        int k = 63 - (int)__builtin_clzll((uint64_t)den);
+        int64_t q = num >> k;
+        int64_t r = num & (den - 1);
+        int64_t twice = r << 1;
+        if (twice > den || (twice == den && (q & 1))) q += 1;
+        return q;
+    }
     int64_t q = num / den;
     int64_t r = num % den;
     if (r < 0) { r += den; q -= 1; }              /* 转成 floor 语义 */
@@ -192,7 +200,11 @@ static inline int64_t nm_apply_scale(int64_t val, nm_scale s)
     uint64_t am = (uint64_t)(s.m < 0 ? -s.m : s.m);
     uint64_t hi, lo, q;
     int bits;
-    nm_mul_wide(av, am, &hi, &lo);
+    if (__builtin_mul_overflow(av, am, &lo)) {
+        nm_mul_wide(av, am, &hi, &lo);            /* 只有真正超 64 位才走宽乘法 */
+    } else {
+        hi = 0;
+    }
     if (s.e < 0) {
         q = nm_u128_shr_round(hi, lo, -(int)s.e);
         return neg ? -(int64_t)q : (int64_t)q;
@@ -213,7 +225,11 @@ static inline int64_t nm_rescale(int64_t val, nm_scale s, int frac_bits)
     uint64_t am = (uint64_t)(s.m < 0 ? -s.m : s.m);
     uint64_t hi, lo, q;
     int bits;
-    nm_mul_wide(av, am, &hi, &lo);
+    if (__builtin_mul_overflow(av, am, &lo)) {
+        nm_mul_wide(av, am, &hi, &lo);            /* 只有真正超 64 位才走宽乘法 */
+    } else {
+        hi = 0;
+    }
     if (shift < 0) {
         q = nm_u128_shr_round(hi, lo, (int)(-shift));
         return neg ? -(int64_t)q : (int64_t)q;
@@ -279,22 +295,53 @@ static inline nm_scale nm_mul_int_u128(nm_scale a, nm_u128 k)
  *
  * 预期行为：这就是 per-tensor 动态量化的取码式 `round(v * den / num)`（den = 127 * 128）。
  *           商 |q| ≤ 128（因为 num ≥ 127 * max|v|），但中间量 |v| * 16256 能到 2^65，
- *           所以先把 |v| * 16256 拆成 128 位，再用减法计数求商与余数。 */
+ *           所以先把 |v| * 16256 拆成 128 位，再用 8 位长除法求商与余数。 */
 static inline int64_t nm_requant_code_u128(int64_t v, nm_u128 num)
 {
     int neg = v < 0;
-    nm_u128 p, two;
-    uint64_t q = 0;
-    int cmp;
-    nm_mul_wide((uint64_t)(neg ? -v : v), (uint64_t)NM_QUANT_DEN, &p.hi, &p.lo);
-    while (nm_u128_cmp(p, num) >= 0) {            /* 商 |q| <= 128，最多 129 次 */
-        p = nm_u128_sub(p, num);
-        q++;
+    uint64_t av = (uint64_t)(neg ? -v : v);
+    uint64_t p_hi = 0, p_lo, q = 0;
+    int k, cmp;
+
+    if (av <= (UINT64_MAX / (uint64_t)NM_QUANT_DEN)) {
+        p_lo = av * (uint64_t)NM_QUANT_DEN;       /* 单次 64 位乘法，省掉 4 次 32x32 */
+    } else {
+        nm_mul_wide(av, (uint64_t)NM_QUANT_DEN, &p_hi, &p_lo);
+    }
+
+    /* 值域落在 64 位内的快速路径（本模型的 Q16 激活量化点全部走这里）：
+     * 同样的 8 位长除法，但每轮只动 64 位，宽运算量减半。条件里的移位前提是
+     * num * 128 不溢出 64 位；不满足时自动落到下面的 128 位通用分支。 */
+    if (num.hi == 0 && p_hi == 0 && num.lo <= (UINT64_MAX >> 7)) {
+        uint64_t d = num.lo, rem = p_lo, t = d << 7;
+        for (k = 7; k >= 0; k--) {
+            if (rem >= t) { rem -= t; q |= (uint64_t)1 << k; }
+            t >>= 1;
+        }
+        cmp = (rem << 1) > d ? 1 : ((rem << 1) == d ? 0 : -1);
+        if (cmp > 0 || (cmp == 0 && (q & 1))) q++;
+        return neg ? -(int64_t)q : (int64_t)q;
+    }
+    {
+    nm_u128 p, t, two;
+    p.hi = p_hi;
+    p.lo = p_lo;
+    /* 商 |q| ≤ 128 正好 8 位：从最高位 t = num * 128 起逐位试减（长除法），每轮 t 右移一位。
+     * 8 轮定长，取代原来最多 129 次「比较 + 减法」的计数循环。 */
+    t = nm_u128_mul_u64(num, 128u);
+    for (k = 7; k >= 0; k--) {
+        if (nm_u128_cmp(p, t) >= 0) {
+            p = nm_u128_sub(p, t);
+            q |= (uint64_t)1 << k;
+        }
+        t.lo = (t.lo >> 1) | (t.hi << 63);
+        t.hi >>= 1;
     }
     two.hi = (p.hi << 1) | (p.lo >> 63);          /* 2 * 余数；余数 < num < 2^67 → 不溢出 */
     two.lo = p.lo << 1;
     cmp = nm_u128_cmp(two, num);
     if (cmp > 0 || (cmp == 0 && (q & 1))) q++;
+    }
     return neg ? -(int64_t)q : (int64_t)q;
 }
 
