@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO / "train"))
 
 from _ckpt import latest_ckpt  # noqa: E402
 from ref.model import Int8Model  # noqa: E402
+from ref.nonlinear import EXP_LUT, LOG1P_LUT  # noqa: E402
 from ref.weights import load_weights  # noqa: E402
 
 C_DIR = HERE.parents[1] / "c"
@@ -60,6 +61,22 @@ def run_engine(exe, tokens):
             steps.append(([int(v) for v in line.split()], pending))
             pending = None
     return steps, range_error
+
+
+@pytest.mark.skipif(GCC is None, reason="需要 gcc 才能编译 C 引擎")
+def test_lut_expansion_matches_python(engine_exe):
+    """Q15 表展开：C 侧 nm_lut_init() 从二阶差分位流解出的两张表，逐项等于 Python 参考。
+
+    预期行为：两段各 NM_LUT_N 项，与 ref.nonlinear 的 EXP_LUT / LOG1P_LUT 完全一致。
+              这条用例不需要 checkpoint —— 它只查表本身，表错就是表错。
+    """
+    proc = subprocess.run([str(engine_exe)], input="LUT\n", capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    vals = [int(v) for v in proc.stdout.split()]
+    n = len(EXP_LUT)
+    assert len(vals) == 2 * n, "表项数不对：C 给了 %d 项" % len(vals)
+    assert vals[:n] == list(EXP_LUT), "exp 表与 Python 参考不一致"
+    assert vals[n:] == list(LOG1P_LUT), "log1p 表与 Python 参考不一致"
 
 
 @pytest.mark.skipif(GCC is None, reason="需要 gcc 才能编译 C 引擎")

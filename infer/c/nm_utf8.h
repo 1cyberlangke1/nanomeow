@@ -59,6 +59,20 @@ static inline int nm_utf8_valid(const uint8_t *b, int n)
     return cp >= 0x10000 && cp <= 0x10FFFF;
 }
 
+/* 输入：已经校验过的完整 UTF-8 序列、长度；输出：码点。
+ * 预期行为：调用前必须先用 nm_utf8_seq_len 拿到长度、用 nm_utf8_valid 验过；这里不重复校验。
+ *           抽出来是为了让 nm_font_glyph_utf8 与 nm_oled_put_utf8 共用一份解码，少一份 .text。 */
+static inline uint32_t nm_utf8_decode(const uint8_t *b, int n)
+{
+    if (n == 1) return (uint32_t)b[0];
+    if (n == 2) return ((uint32_t)(b[0] & 0x1F) << 6) | (uint32_t)(b[1] & 0x3F);
+    if (n == 3)
+        return ((uint32_t)(b[0] & 0x0F) << 12) | ((uint32_t)(b[1] & 0x3F) << 6)
+               | (uint32_t)(b[2] & 0x3F);
+    return ((uint32_t)(b[0] & 0x07) << 18) | ((uint32_t)(b[1] & 0x3F) << 12)
+           | ((uint32_t)(b[2] & 0x3F) << 6) | (uint32_t)(b[3] & 0x3F);
+}
+
 /* 输入：序列缓冲、已经到手的字节数（1..need）；输出：1 = 目前还合法，0 = 现在就能判定非法。
  * 预期行为：CPython 的 UTF-8 解码器是边收边校验的，所以首字节的特殊范围
  *           （0xE0 的次字节 >= 0xA0、0xED 的次字节 <= 0x9F、0xF0 的次字节 >= 0x90、

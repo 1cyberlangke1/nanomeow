@@ -16,6 +16,8 @@ from collections import Counter
 
 CELL = 8                      # 8x8 点阵
 ROW_BYTES = CELL - 1          # 只存第 1..7 行，每行 1 字节（bit7..bit1 是第 0..6 列）
+INK_BITS = CELL - 1           # 行内只存 bit7..bit1（第 7 列恒空）
+GLYPH_BITS = ROW_BYTES * INK_BITS   # 每字打包后占的位数（49）
 
 
 def parse_bdf(path):
@@ -89,6 +91,15 @@ def packed(cell):
     return bytes(cell[1:])
 
 
+def packed_size(n):
+    """输入：字数；输出：点阵位流占的字节数。
+
+    预期行为：与 infer/c/gen_font.py 的 pack_glyphs 同一口径 —— 每字 GLYPH_BITS 位紧密打包、
+              向上取整到字节，表尾再补 1 个 0 字节当 C 侧解包的哨兵。所以这是字库在 Flash 里的真实占用。
+    """
+    return (n * GLYPH_BITS + 7) // 8 + 1
+
+
 def varint_size(values):
     """输入：已排序的码点列表；输出：增量 LEB128 编码后的总字节数。
 
@@ -135,7 +146,7 @@ def select(freq, glyphs, ascent, budget):
             continue
         blob = packed(to_cell(*glyphs[cp], ascent))
         cps = sorted([c for c, _ in chosen] + [cp])
-        if len(cps) * ROW_BYTES + varint_size(cps) > budget:
+        if packed_size(len(cps)) + varint_size(cps) > budget:
             skipped.append(ch)
             continue
         chosen.append((cp, blob))
@@ -152,9 +163,9 @@ def main():
     ap.add_argument("--corpus", type=pathlib.Path,
                     default=pathlib.Path("train/data/chitchat_para.jsonl"))
     ap.add_argument("--out", type=pathlib.Path, default=pathlib.Path("infer/font/subset_8x8.txt"))
-    ap.add_argument("--budget", type=int, default=2900,
-                    help="点阵 + 码点表的字节上限；默认值按「整机 Flash 余 3,480 B，"
-                         "扣掉查表代码 344 B、.ARM.exidx 16 B，再给 OLED 驱动留 ~220 B」定的")
+    ap.add_argument("--budget", type=int, default=5078,
+                    help="点阵（打包后）+ 码点表的字节上限。默认 5078 = 当前上板固件给字库的额度"
+                         "（整机 63,502 B / 64 KiB 余 2,034 B，加上字库现有 3,044 B；查表代码另占）")
     args = ap.parse_args()
 
     ascent, glyphs = None, {}
@@ -174,16 +185,18 @@ def main():
     if not chosen:
         raise SystemExit("一个字都没选中，预算太小？")
     cps = [cp for cp, _ in chosen]
-    total = len(chosen) * ROW_BYTES + varint_size(cps)
+    total = packed_size(len(chosen)) + varint_size(cps)
+    raw = len(chosen) * ROW_BYTES + varint_size(cps)
 
     lines = [
         "# nanomeow 8x8 子集字库（自动生成，请勿手改）：infer/font/select_subset.py",
         "# 来源：fusion-pixel-font 8px 等宽 zh_hans + latin（OFL-1.1），见同目录 LICENSE-OFL.txt",
-        "# 选字：%s 的 bot 侧字符，按词频降序，字节上限 %d" % (args.corpus.as_posix(), args.budget),
+        "# 选字：%s 的 bot 侧字符，按词频降序，字节上限 %d（点阵按 %d 位/字打包后的实际占用）"
+        % (args.corpus.as_posix(), args.budget, GLYPH_BITS),
         "# 点阵：每字 7 行（原字体第 0 行与第 7 列恒空，不存），行内 bit7..bit1 是第 0..6 列",
         "# 每行：<码点十六进制> <7 行点阵十六进制> <字符>",
-        "# 收录 %d 字 / %d 字节；因超预算放弃 %d 字；因 BDF 缺字形放弃 %d 字"
-        % (len(chosen), total, len(skipped), len(missing)),
+        "# 收录 %d 字 / %d 字节（打包后；本表原样是 %d 字节）；因超预算放弃 %d 字；因 BDF 缺字形放弃 %d 字"
+        % (len(chosen), total, raw, len(skipped), len(missing)),
     ]
     for cp, blob in chosen:
         lines.append("%04X %s %s" % (cp, blob.hex().upper(), chr(cp)))
@@ -199,8 +212,9 @@ def main():
         back[int(cp_hex, 16)] = bytes.fromhex(blob_hex)
     if back != dict(chosen):
         raise SystemExit("自检失败：%s 回读结果与内存里不一致" % args.out)
-    print("写入 %s：%d 字 / %d 字节（预算 %d，放弃 %d 字）"
-          % (args.out.as_posix(), len(chosen), total, args.budget, len(skipped) + len(missing)))
+    print("写入 %s：%d 字 / %d 字节打包（原 %d 字节，预算 %d，放弃 %d 字）"
+          % (args.out.as_posix(), len(chosen), total, raw, args.budget,
+             len(skipped) + len(missing)))
 
 
 if __name__ == "__main__":

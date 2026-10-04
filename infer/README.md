@@ -15,6 +15,10 @@
 | `c/nm_utf8.h` | 增量 UTF-8 解码，不吐半截序列 |
 | `c/nm_weights.c` | 权重描述表，由 `gen_weights.py` 生成 |
 | `c/nm_font.c` / `c/nm_font.h` | 8x8 子集字库与查表，由 `gen_font.py` 生成 |
+| `c/nm_oled.c` / `c/nm_oled.h` | SSD1306 128x64 显示层：帧缓冲、8x8 字形渲染、按脏页刷新 |
+| `c/nm_oled_port.c` / `c/nm_stm32f103.h` | 上板移植层：PB6/PB7 软件 I2C 与最小寄存器表 |
+| `c/nm_fw.c` | 上板固件入口：72 MHz 时钟 + USART1 收行 + OLED 显示 |
+| `firmware/` | 上板构建：`m3.ld`（64K/20K 链接脚本）、`build_firmware.py`（交叉编译 + 段账本 + 闸门）、`arm_inc/`（freestanding 下的 `string.h` 桩） |
 | `font/` | 字库来源说明、选字脚本 `select_subset.py`、选字清单与许可原件 |
 | `c/*_selftest.c` | 定点内核 / UTF-8 解码器 / 引擎对拍三个自检 |
 | `model_weights.h`、`model_cfg.h` | 导出产物：int8 码 + 每条 scale 的 (乘子, 移位) |
@@ -43,8 +47,21 @@ cmake --build build\infer
 gcc -std=c99 -O2 -Wall -Wextra -Werror -I infer/c -o nm_chat.exe infer/c/nm_chat.c infer/c/nm_gen.c infer/c/nanomeow.c infer/c/nm_weights.c infer/c/nm_font.c
 ```
 
-上板：把 c/ 下的 .c/.h（不含 nm_chat.c）加进工程，头文件路径指向 infer/c 与 infer/；
-调用顺序是 nm_reset → 逐 token nm_forward_token → nm_gen_pick 取下一个字节。
+上板：`c/nm_fw.c` 就是能直接烧的固件入口（自带复位向量与中断向量表），它把系统时钟配到
+72 MHz（HSE 8 MHz × 9）、开 USART1（PA9/PA10，115200 8N1）、点 SSD1306，然后循环
+「显示 `user:` → 收一行 → 拼 `user:<内容>\nbot:` → 生成 → 边生成边把字符刷到屏上」，
+同一份字节也回显到串口。OLED 走 PB6 = SCL、PB7 = SDA 的软件 I2C（开漏，~400 kHz）。
+把它和 `nanomeow.c` / `nm_gen.c` / `nm_weights.c` / `nm_font.c` / `nm_oled.c` / `nm_oled_port.c`
+一起编进去即可；只想自己接管显示的话，实现一个 `nm_oled_bus_write` 就能复用整个显示层。
+
+上板构建一条命令（链接脚本与闸门都在仓库里，交叉编译器默认取 PATH 上的 clang / zig，取不到再退回 msys2 ucrt64 与本机 ziglang）：
+
+```powershell
+.\.venv\Scripts\python.exe infer\firmware\build_firmware.py
+```
+
+它按程序头统计真正要烧进 Flash / RAM 的字节，并检查**各目标文件的未定义符号**里没有
+`__aeabi_f*` / `__aeabi_d*`（纯整数）—— 不能在链接产物上查，lld 出来的 ELF 没有符号表，那样查永远是「无」。任一闸门不过就以非 0 退出。
 
 ## 闸门
 
@@ -97,10 +114,16 @@ STM32F103C8T6 的 64K/20K）：
 
 两点结论：
 
-- 16×16 汉字库（13,760 B）塞不进去，所以上板改用 **8x8 子集字库**：`font/` 下 357 字、
-  点阵+码点表 2,906 B、含查表代码合计 3,266 B，整机 Flash 变成 **62,660 B，64 KiB 余 2,876 B**。
-  全量 8x8（701 字 / 5,623 B）还差约 2.4 KB，取舍见 `font/README.md`。
-- 余量 2,876 B，够放 SSD1306 之类的 OLED 驱动（I2C 位操作 + 初始化序列 + 渲染，通常 1.5~2 KB）。
+- 16×16 汉字库（13,760 B）塞不进去，所以上板改用 **8x8 子集字库**：`font/` 下 422 字、
+  点阵+码点表 3,412 B、含查表代码合计 3,756 B。全量 8x8（698 字 / 5,618 B）比现在多
+  2,206 B，取舍见 `font/README.md`。
+- OLED 驱动与固件入口已经写完（`c/nm_oled.c`、`c/nm_oled_port.c`、`c/nm_fw.c`），用仓库里的
+  `firmware/build_firmware.py` 真编真链（入口就是 `nm_fw.c` 的 `Reset_Handler`，不靠 `-u`）：
+  .isr_vector 192 + .text 12,686 + .rodata 52,416 = **65,294 B = 63.76 KiB（64 KiB 余 242 B）**；
+  .bss **14,736 B = 14.39 KiB（20 KiB 余 5,744 B，剩下的正好当栈）**。
+  `firmware/m3.ld` 里丢弃了 `.ARM.exidx`（裸机没有异常处理，只有调试器回溯会用到），
+  白捡的 512 B 全给了字库：357 字 → 422 字。242 B 只够这个固件本身，再往上加东西
+  （按键、更大字库、更多显示）就得先腾 Flash。
   工具链会影响结果：zig 自己的代码生成明显差（实测 zig -Oz 单目标
   14,190 B vs clang -Oz 9,640 B），所以本机用「clang 编 + zig 的 lld 链」而不是 `zig cc`
   一键编链；上板前最好再用 arm-none-eabi-gcc 复核一次。

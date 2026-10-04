@@ -15,6 +15,41 @@
 
 int nm_range_error = 0;
 
+/* 两张 Q15 表（exp / log1p）放 RAM，由 nm_lut.h 的位流展开而来：原样存要 1,028 B Flash，
+ * 现在存每步 2 bit 的二阶差分（138 B），代价是 RAM 多 1,028 B。展开是纯整数、逐项不变。 */
+uint16_t nm_exp_lut[NM_LUT_N];
+uint16_t nm_log1p_lut[NM_LUT_N];
+static int s_lut_ready;
+
+/* 输入：输出缓冲、表长 n、初值 v0、首差 d0、二阶差基值 lo、每步 2 bit 的位流 dd。
+ * 输出：无（就地填满 out 的前 n 项）。
+ * 预期行为：out[0] = v0；之后 v += d，d 从第 2 步起每步加 (lo + 位流字段)；
+ *           与 infer/c/gen_lut.py 的 encode / pack 互逆，解出的表逐项等于 Python 参考。 */
+static void nm_lut_expand(uint16_t *out, int n, int v0, int d0, int lo, const uint32_t *dd)
+{
+    int v = v0, d = d0, i;
+    out[0] = (uint16_t)v;
+    if (n < 2) return;
+    v += d;                          /* 第 1 步用的还是首差 d0，还没吃二阶差字段 */
+    out[1] = (uint16_t)v;
+    for (i = 2; i < n; i++) {
+        int k = i - 2;
+        d += lo + (int)((dd[k >> 4] >> ((k & 15) * 2)) & 3u);
+        v += d;
+        out[i] = (uint16_t)v;
+    }
+}
+
+/* 输入：无；输出：无。预期行为：把两张表展开进 RAM，只做一次（幂等）；
+ * nm_forward_token 每次进来先调它，自检程序也可以直接调来核对表内容。 */
+void nm_lut_init(void)
+{
+    if (s_lut_ready) return;
+    nm_lut_expand(nm_exp_lut, NM_LUT_N, nm_exp_lut_v0, nm_exp_lut_d0, nm_exp_lut_lo, nm_exp_lut_dd);
+    nm_lut_expand(nm_log1p_lut, NM_LUT_N, nm_log1p_lut_v0, nm_log1p_lut_d0, nm_log1p_lut_lo, nm_log1p_lut_dd);
+    s_lut_ready = 1;
+}
+
 #define NM_FRAC_BITS 16
 #define NM_ONE (1 << NM_FRAC_BITS)
 #define NM_LUT_STEP_SHIFT 8
@@ -133,7 +168,7 @@ static nm_scale nm_row_scale(const nm_mat *m, int row)
 {
     nm_scale s;
     if (!m->per_row) {
-        const uint8_t *q = m->scale;
+        const uint8_t *q = nm_pool + m->scale_off;
         uint32_t v = (uint32_t)q[0] | ((uint32_t)q[1] << 8)
                      | ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
         s.m = (int32_t)(((v >> 7) | (1u << 23)) << 7);
@@ -141,7 +176,7 @@ static nm_scale nm_row_scale(const nm_mat *m, int row)
         return s;
     }
     {
-        const uint8_t *p = m->scale;
+        const uint8_t *p = nm_pool + m->scale_off;
         uint32_t rows = (uint32_t)m->rows, mb = (rows * 23u + 7u) >> 3;
         uint32_t w = p[mb + 1];
         uint32_t sh = (uint32_t)(int32_t)(int8_t)p[mb];
@@ -157,18 +192,19 @@ static nm_scale nm_row_scale(const nm_mat *m, int row)
  *           行号先经位流末尾的索引表映射 —— 省 Flash 的代价是每次取行多一次位流解码。 */
 static const int8_t *nm_row_codes(const nm_mat *m, int row)
 {
+    const uint8_t *p = nm_pool + m->scale_off;
     uint32_t idx = (uint32_t)row;
     if (m->idx_bits)
-        idx = nm_read_bits(m->scale + nm_index_off(m->scale, (uint32_t)m->rows),
+        idx = nm_read_bits(p + nm_index_off(p, (uint32_t)m->rows),
                            (uint32_t)row * m->idx_bits, m->idx_bits);
-    return m->codes + (size_t)idx * (uint32_t)m->cols;
+    return (const int8_t *)(nm_pool + m->code_off) + (size_t)idx * (uint32_t)m->cols;
 }
 
 /* 输入：per-tensor 权重（如 x_r / k_k / r_k）；输出：装成张量的它。 */
 static void nm_param(const nm_mat *m, int n, nm_tensor *out)
 {
     int i;
-    for (i = 0; i < n; i++) out->v[i] = m->codes[i];
+    for (i = 0; i < n; i++) out->v[i] = (int8_t)nm_pool[m->code_off + i];
     out->scale = nm_row_scale(m, 0);
 }
 
@@ -459,6 +495,47 @@ static void nm_softplus_t(const nm_tensor *x, int n, int quantize, nm_tensor *ou
 
 /* ================= 整数 GEMV + 动态再量化 ================= */
 
+/* 输入：int8 码行（成对版本给两行）、int32 输入、列数；输出：点积（成对版本写进出参）。
+ * 预期行为：与逐项 `a += row[j] * xs[j]` 完全同序同值 —— 每一行仍然是从 j = 0 加到 n-1 的
+ *           精确 int32 累加，只是换了循环结构，所以结果逐位相同。
+ * 两行版本让同一列的两个 x 只载入一次：Cortex-M3 上实测从 5 条/MAC 降到 3.5 条。
+ * 循环写成 do-while 而不是 for：顶部判断 + 底部回跳会多一条分支（实测 6 条/MAC）。
+ * 用 always_inline 是因为 -Oz 会把普通 static inline 变成逐行函数调用，反而更慢。 */
+static inline __attribute__((always_inline))
+int32_t nm_dot_i8(const int8_t *row, const int32_t *xs, int n)
+{
+    const int8_t *rp = row;
+    const int32_t *xp = xs;
+    int32_t a = 0;
+    int j = n;
+
+    if (j > 0) {
+        do {
+            a += (int32_t)*rp++ * *xp++;
+        } while (--j);
+    }
+    return a;
+}
+
+static inline __attribute__((always_inline))
+void nm_dot2_i8(const int8_t *ra, const int8_t *rb, const int32_t *xs, int n,
+                int32_t *out_a, int32_t *out_b)
+{
+    const int32_t *xp = xs;
+    int32_t a = 0, b = 0;
+    int j = n;
+
+    if (j > 0) {
+        do {
+            int32_t x = *xp++;
+            a += (int32_t)*ra++ * x;
+            b += (int32_t)*rb++ * x;
+        } while (--j);
+    }
+    *out_a = a;
+    *out_b = b;
+}
+
 /* 输入：输入张量、per-row 权重、是否量化输出；输出：张量。
  * 预期行为：acc = Σ w * x；每行实值 = acc * s_w * s_x，先把各行对齐到公共指数（= Python 的
  *           MAX_ALIGN_SHIFT 口径），quantize=True 时再按 per-tensor 动态口径量化回 int8。 */
@@ -473,13 +550,17 @@ static void nm_linear(const nm_tensor *x, const nm_mat *m, int quantize, nm_tens
      * （Cortex-M3 上是 __aeabi_lmul 软件例程）。 */
     for (j = 0; j < m->cols; j++) xs[j] = (int32_t)x->v[j];
     for (r = 0; r < m->rows; r++) {
-        int32_t a = 0;
-        const int8_t *row = nm_row_codes(m, r);
-        for (j = 0; j < m->cols; j++) a += (int32_t)row[j] * xs[j];
-        acc[r] = a;
         sc[r] = nm_mul(nm_row_scale(m, r), x->scale);
         if (sc[r].e < e_ref) e_ref = sc[r].e;
     }
+    for (r = 0; r + 1 < m->rows; r += 2) {
+        int32_t a, b;
+        nm_dot2_i8(nm_row_codes(m, r), nm_row_codes(m, r + 1), xs, m->cols, &a, &b);
+        acc[r] = a;
+        acc[r + 1] = b;
+    }
+    if (r < m->rows)
+        acc[r] = nm_dot_i8(nm_row_codes(m, r), xs, m->cols);
     for (r = 0; r < m->rows; r++) {
         int sh = sc[r].e - e_ref;
         if (sh > 40) { nm_range_error = 1; sh = 40; }
@@ -511,10 +592,9 @@ static void nm_head_linear(const nm_tensor *x, const nm_mat *m, int8_t *codes, n
         if (sc.e < e_ref) e_ref = sc.e;
     }
     for (r = 0; r < m->rows; r++) {
-        int32_t a = 0, sh;
-        const int8_t *row = nm_row_codes(m, r);
+        int32_t a, sh;
         nm_scale sc = nm_mul(nm_row_scale(m, r), x->scale);
-        for (j = 0; j < m->cols; j++) a += (int32_t)row[j] * xs[j];
+        a = nm_dot_i8(nm_row_codes(m, r), xs, m->cols);
         sh = sc.e - e_ref;
         if (sh > 40) { nm_range_error = 1; sh = 40; }
         s_head[r] = nm_shl_checked((int64_t)a * sc.m, sh);
@@ -644,7 +724,8 @@ static int32_t s_w15[NM_N_EMBD];
 static void nm_embed(int token, nm_tensor *out)
 {
     int j;
-    for (j = 0; j < NM_N_EMBD; j++) out->v[j] = nm_emb_weight.codes[token * NM_N_EMBD + j];
+    for (j = 0; j < NM_N_EMBD; j++)
+        out->v[j] = (int8_t)nm_pool[nm_emb_weight.code_off + token * NM_N_EMBD + j];
     out->scale = nm_row_scale(&nm_emb_weight, token);
 }
 
@@ -802,6 +883,7 @@ void nm_forward_token(int token, nm_layer_state *states, int8_t *logits, nm_scal
     nm_tensor x, h, att_out, ffn_out, v_first;
     int v_first_valid = 0;
 
+    nm_lut_init();                   /* 幂等：第一次进来把两张 Q15 表展开进 RAM */
     nm_embed(token, &x);
     for (i = 0; i < NM_N_LAYER; i++) {
         nm_layer_state *st = &states[i];

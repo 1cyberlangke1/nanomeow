@@ -73,7 +73,7 @@ TOP_FIELDS = (("nm_emb_weight", "nmw_emb_weight"),
               ("nm_ln_out_bias", "nmw_ln_out_bias"),
               ("nm_head_weight", "nmw_head_weight"))
 
-EMPTY_MAT = "{NULL, NULL, 0, 0, 0, 0}"
+EMPTY_MAT = "{0, 0, 0, 0, 0, 0}"
 
 
 def int_list(text, sym):
@@ -240,22 +240,26 @@ def display_name(sym):
     return prefix + rest
 
 
-def mat_expr(sym, lens, is_array, idx_bits, pooled):
-    """输入：符号名、元素个数表、数组标记表、索引位宽、是否有唯一行池；输出：一个 nm_mat 表达式。
+def mat_shape(sym, lens, is_array, idx_bits):
+    """输入：符号名、元素个数表、数组标记表、索引位宽；输出：(rows, cols, per_row, idx_bits)。
 
-    预期行为：有行池时 codes 指向去重后的池（nmwc_ 前缀），否则指向头文件里的原始码。
+    预期行为：per-row 张量用头文件声明的行数，per-tensor 张量视作 1 行；码数不是行数整数倍时报错。
     """
     if sym not in lens:
         raise SystemExit("自检失败：头文件里没有符号 %s" % sym)
     n = lens[sym]
-    pack = "nmwp_" + sym[len("nmw_"):]
-    codes = ("nmwc_" + sym[len("nmw_"):]) if pooled else sym
     if is_array.get(sym + "_mul", False):
         rows = lens[sym + "_mul"]
         if rows <= 0 or n % rows:
             raise SystemExit("自检失败：%s 的码数 %d 不是行数 %d 的整数倍" % (sym, n, rows))
-        return "{%s, %s, %d, %d, 1, %d}" % (codes, pack, rows, n // rows, idx_bits)
-    return "{%s, %s, 1, %d, 0, 0}" % (codes, pack, n)
+        return rows, n // rows, 1, idx_bits
+    return 1, n, 0, 0
+
+
+def mat_expr(shape, code_off, scale_off):
+    """输入：(rows, cols, per_row, idx_bits) 与权重池里的码 / scale 偏移；输出：一个 nm_mat 表达式。"""
+    rows, cols, per_row, idx_bits = shape
+    return "{%d, %d, %d, %d, %d, %d}" % (code_off, scale_off, rows, cols, per_row, idx_bits)
 
 
 def parse_defines(text):
@@ -339,6 +343,18 @@ def main():
             blob = pack_scale_tensor(muls[0], shifts[0], sym)
             code_total += n
         blobs[sym] = blob
+
+    # 所有码与 scale 位流拼进一个池：描述符只存 uint16 偏移，12 B -> 8 B（109 个共省 436 B）。
+    pool, offs = bytearray(), {}
+    for sym in tensors:
+        codes = pools[sym] if sym in pools else int_list(hdr, sym)
+        code_off = len(pool)
+        pool += bytes(v & 0xFF for v in codes)
+        scale_off = len(pool)
+        pool += blobs[sym]
+        offs[sym] = (code_off, scale_off) + mat_shape(sym, lens, is_array, idxbits[sym])
+    if len(pool) > 65535:
+        raise SystemExit("自检失败：权重池 %d B 超过 uint16 偏移上限 65535" % len(pool))
     scale_total = sum(len(blobs[s]) for s in tensors)
     state_total = state_bytes(d) * d["NM_N_LAYER"]
 
@@ -381,19 +397,17 @@ def main():
         " */",
     ]
 
-    lines = head + ["", '#include <stddef.h>', '#include "../model_weights.h"', '#include "nanomeow.h"', "",
-                    "/* 无损压缩后的 scale 位流（口径见 gen_weights.py，与 nanomeow.c 的",
-                    " * nm_row_scale / nm_row_codes 互逆）：per-tensor 是 4 B 小端；",
-                    " * per-row 是 [尾数 23 位][1 B 基线][1 B 增量位宽][增量][行索引]，",
-                    " * 行索引只在 idx_bits > 0（该张量的码被去重）时才有。原始的 nmw_*_mul /",
-                    " * nmw_*_shift、以及被去重张量的原始码都已没人引用，编译器会把它们丢掉。 */"]
-    for sym in tensors:
-        lines.append("static const uint8_t nmwp_%s[] = {%s};"
-                     % (sym[len("nmw_"):], ",".join(str(v) for v in blobs[sym])))
-    for sym in tensors:
-        if sym in pools:
-            lines.append("static const int8_t nmwc_%s[] = {%s};"
-                         % (sym[len("nmw_"):], ",".join(str(v) for v in pools[sym])))
+    lines = head + ["", '#include <stddef.h>', '#include "nanomeow.h"', "",
+                    "/* 权重池：所有张量的 int8 码与 scale 位流首尾相接（顺序 = 上面那张表），",
+                    " * 描述符只存池内 uint16 偏移。scale 位流的口径见 gen_weights.py，与 nanomeow.c",
+                    " * 的 nm_row_scale / nm_row_codes 互逆：per-tensor 是 4 B 小端；per-row 是",
+                    " * [尾数 23 位][1 B 基线][1 B 增量位宽][增量][行索引]，行索引只在 idx_bits > 0",
+                    " * （该张量的码被去重）时才有。model_weights.h 里的原始码与 mul/shift 已经没人",
+                    " * 引用，所以本文件不再 include 它（少解析 199 KB）。 */",
+                    "const uint8_t nm_pool[%d] = {" % len(pool)]
+    for i in range(0, len(pool), 24):
+        lines.append("    " + ",".join(str(v) for v in pool[i:i + 24]) + ",")
+    lines.append("};")
     lines += ["", "const nm_block nm_blocks[NM_N_LAYER] = {"]
     for layer in range(N_LAYER):
         lines.append("    { /* layer %d */" % layer)
@@ -404,13 +418,14 @@ def main():
                     raise SystemExit("自检失败：第 %d 层缺字段 %s（%s）" % (layer, field, sym))
                 lines.append("        %s," % EMPTY_MAT)
                 continue
-            lines.append("        %s," % mat_expr(sym, lens, is_array, idxbits[sym], sym in pools))
+            lines.append("        %s,  /* %s */"
+                         % (mat_expr(offs[sym][2:], offs[sym][0], offs[sym][1]), sym))
         lines.append("    },")
     lines.append("};")
     lines.append("")
     for name, sym in TOP_FIELDS:
-        lines.append("const nm_mat %s = %s;"
-                     % (name, mat_expr(sym, lens, is_array, idxbits[sym], sym in pools)))
+        lines.append("const nm_mat %s = %s;  /* %s */"
+                     % (name, mat_expr(offs[sym][2:], offs[sym][0], offs[sym][1]), sym))
     lines.append("")
     OUT.write_text("\n".join(lines), encoding="utf-8", newline="\n")
 
