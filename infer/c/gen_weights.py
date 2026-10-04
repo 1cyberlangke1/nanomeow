@@ -227,7 +227,7 @@ def main():
         " */",
     ]
 
-    lines = head + ["", '#include "../model_weights.h"', '#include "nanomeow.h"', "",
+    lines = head + ["", '#include <stddef.h>', '#include "../model_weights.h"', '#include "nanomeow.h"', "",
                     "const nm_block nm_blocks[NM_N_LAYER] = {"]
     for layer in range(N_LAYER):
         lines.append("    { /* layer %d */" % layer)

@@ -54,17 +54,26 @@ def _fq() -> IntxFakeQuantizer:
 
 
 def _fq_tensor() -> IntxFakeQuantizer:
-    """输入：无；输出：关闭状态的 per-tensor int8 假量化器（常量 / wkv 本体插桩点）。
+    """输入：无；输出：关闭状态的 per-tensor int8 假量化器（逐元素常量插桩点）。
 
-    预期行为：两类都必须是整张量一个 scale：
-              - x_r…x_g / w0 / a0 / v0 / k_k / k_a / r_k / ln 的 weight+bias 与位置
-                无关，部署侧导出时就是一条 per-tensor scale；换成逐位置会把每个元素
-                单独量化，等于不量化。
-              - wkv 本体的 q/k/v/a/b：它的 scale 要当 int32 state 的量化步长用，
-                而 CUDA kernel 的 `state_step` 是 0 维标量，喂不进逐位置的步长，
-                所以这里保持 per-tensor（与 kernel 同口径）。
+    预期行为：x_r…x_g / w0 / a0 / v0 / k_k / k_a / r_k / ln 的 weight+bias 与位置无关，
+              部署侧导出时就是一条 per-tensor scale；换成逐位置会把每个元素单独量化，
+              等于不量化。
     """
     return IntxFakeQuantizer(per_tensor_int8(), enabled=False)
+
+
+def _fq_wkv() -> IntxFakeQuantizer:
+    """输入：无；输出：关闭状态的 per-position int8 假量化器（wkv7 递推本体插桩点）。
+
+    预期行为：q/k/v/a/b 按 (batch,time) 位置分组量化，对齐部署侧 —— `infer/ref/model.py`
+              在 T=1 时对每个 token 的 q/k/v/a/b 各做一次 per-tensor 动态量化，也就是
+              「一个 token 一组 scale」。训练侧用整批整段一个 scale 会让绝大多数 token
+              用不到 int8 的完整动态范围，模型照着比部署粗得多的噪声在学。
+
+              实测（同一份权重、71 条短句教师强制整句率）：整批口径 64.8% vs 逐位置 76.1%。
+    """
+    return IntxFakeQuantizer(per_position_int8(), enabled=False)
 
 
 def _fq_w() -> IntxFakeQuantizer:
@@ -227,7 +236,7 @@ class RWKV_Tmix_x070(nn.Module):
         self.fq_act = _fq()
         self.fq_param = _fq_tensor()
         self.fq_w = _fq_w()
-        self.fq_wkv = _fq_tensor()
+        self.fq_wkv = _fq_wkv()
 
     def matmul_w(self, x, p):
         """输入：激活 x (..., K)、裸权重 p (K, N)；输出：假量化后的 x @ p。

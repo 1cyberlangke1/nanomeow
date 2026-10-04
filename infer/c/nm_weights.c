@@ -117,6 +117,7 @@
  *                  = 11884 B（11.6 KiB），不含调用栈
  */
 
+#include <stddef.h>
 #include "../model_weights.h"
 #include "nanomeow.h"
 

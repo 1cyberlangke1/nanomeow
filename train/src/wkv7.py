@@ -130,7 +130,13 @@ def _wkv7_chunked_fp32(w, q, k, v, a, b, state_in, chunk, qat=None):
         log_w = torch.log(torch.clamp(w_lut, min=2.0 ** -WKV_LUT_FRAC_BITS))
         # state 存 int32：量化步长就是 k·vᵀ 累加器的最小单位 scale_k × scale_v，
         # 直接取量化器这一趟用的 scale，不在本地按范围重算。
+        # 量化器若是逐位置粒度（部署侧就是「每个 token 一组 scale」），
+        # state_step 会带 (B,T) 维，而 state 是 (B,H,N,N)，广播不上；
+        # 收口成一个标量（取这批位置里最粗的格子）。per-tensor 时本来就是 1 个元素，
+        # 这一步不改任何数值。
         state_step = (k_scale * v_scale).clamp_min(1e-12)
+        if state_step.numel() > 1:
+            state_step = state_step.amax()
     else:
         state_step = None
 
