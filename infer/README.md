@@ -68,9 +68,27 @@ gcc -std=c99 -O2 -Wall -Wextra -Werror -I infer/c -o nm_chat.exe infer/c/nm_chat
 这些用等价替身实现量过：.text 404 + .ARM.exidx 72 + .isr_vector 192 + .rodata 4 = 672 B。
 一起算上，整机约 64,984 B = 63.46 KiB，64 KiB 只剩 552 B 余量。
 
+**真实链接实测**（msys2 clang 22.1.8 用 `--target=armv7m-none-eabi -mthumb -mcpu=cortex-m3 -Oz
+-ffreestanding -fno-unwind-tables` 编代码，再用 zig 自带的 lld 链接，链接脚本就是
+STM32F103C8T6 的 64K/20K）：
+
+| 段 | 字节 |
+|---|---|
+| .isr_vector | 192 |
+| .text | 9,008 |
+| .rodata | 54,888 |
+| .ARM.exidx | 464 |
+| **Flash 合计** | **64,552 = 63.04 KiB（64 KiB 余 984 B）** |
+| .bss（RAM） | 12,148 = 11.86 KiB（20 KiB 余 8,332 B） |
+
+链接**成功**，不是估算；替身运行时（复位入口 + 中断向量表 + 一次前向）已经算在 .text 里。
+无浮点复核：`objdump -t` 看目标文件的未定义符号，只有 `memcpy/memset` 与整数辅助
+`__aeabi_ldivmod / uldivmod / llsl / llsr / lasr`，**没有 `__aeabi_f* / __aeabi_d*`，也没有
+`__aeabi_lmul`**。
+
 两点结论：
 
 - 16×16 汉字库（13,760 B）塞不进去，上板显示中文要另想办法（外部 Flash / 更小字库）。
-- 余量只有 0.5 KiB，而本机没有 arm-none-eabi-gcc，也没有 ARM 版 lld（mingw 的 ld 不支持
-  armelf），所以上面的数字是「引擎逐段 + 替身运行时」的估算，不是真实链接结果；
-  换 arm-none-eabi-gcc 会有出入，上板前需要用真实工具链复核一次。
+- 余量只有 984 B。工具链会影响结果：zig 自己的代码生成明显差（实测 zig -Oz 单目标
+  14,190 B vs clang -Oz 9,640 B），所以本机用「clang 编 + zig 的 lld 链」而不是 `zig cc`
+  一键编链；上板前最好再用 arm-none-eabi-gcc 复核一次。
