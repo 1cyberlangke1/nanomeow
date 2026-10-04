@@ -1,98 +1,64 @@
-# infer/font — OLED 用的 8x8 子集字库
+# infer/font — OLED 嵌入式 8x8 紧凑点阵字库
 
-上板显示模型输出用的点阵字库。**只存子集**：完整的泛中日韩 8px 字库有 27,987 个字形，
-整机 Flash 根本放不下（账本见下），所以按语料词频选字，字库外的码点渲染成兜底方框。
+本项目给 nanomeow 上板运行时用的 SSD1306 OLED 字符显示提供一套超轻量的点阵字库。
+STM32F103C8T6 只有 64 KiB Flash，空间非常紧张，所以字库按**语料词频筛子集 + 紧凑位流压缩**来做，没收录的字符有统一的兜底渲染机制。
 
-## 来源（都是开源点阵字库）
+---
 
-| 项目 | 说明 |
-|---|---|
-| [TakWolf/fusion-pixel-font](https://github.com/TakWolf/fusion-pixel-font) | 8px 等宽泛中日韩点阵，OFL-1.1，3.2k star。**本字库的字形就取自这里** |
-| [ItMarki/MisekiBitmap](https://github.com/ItMarki/MisekiBitmap) | 8x8 简体汉字字形来源（fusion-pixel 的 8px 简体就是它），OFL-1.1 |
-| [dhepper/font8x8](https://github.com/dhepper/font8x8) | 纯 ASCII 8x8，公有领域；**本字库没用它**，留作对照 |
+## 字形来源与开源许可
 
-字形取自 fusion-pixel-font 官方 Release 的 `fusion-pixel-font-8px-monospaced-bdf-v2026.02.27.zip`
-里的 `latin` 与 `zh_hans` 两份 BDF。BDF 是官方栅格化的结果，逐位确定，比拿 PIL 现渲染可靠。
-许可原件在 `licenses/`。
+点阵字形都取自成熟的开源点阵字体项目（遵循 SIL Open Font License 1.1，许可原件放在 `licenses/`）：
 
-## 重新生成
+| 字体来源 | 开源协议 | 用途与说明 |
+| :--- | :--- | :--- |
+| [TakWolf/fusion-pixel-font](https://github.com/TakWolf/fusion-pixel-font) | SIL OFL 1.1 | 8px 等宽泛中日韩点阵字体，字形取自官方发布的 BDF 栅格源文件 |
+| [ItMarki/MisekiBitmap](https://github.com/ItMarki/MisekiBitmap) | SIL OFL 1.1 | fusion-pixel-font 简体中文汉字的上游字形来源 |
 
-BDF 单份 3 MB，不入库（`tmp/` 已被 .gitignore 忽略）。要重新选字就先下载解压：
+---
 
-```powershell
-$env:HTTPS_PROXY='http://127.0.0.1:7890'
-curl.exe -sL -o tmp\f8.bdf.zip https://github.com/TakWolf/fusion-pixel-font/releases/download/2026.02.27/fusion-pixel-font-8px-monospaced-bdf-v2026.02.27.zip
-.\.venv\Scripts\python.exe -c "import zipfile; zipfile.ZipFile(r'tmp\f8.bdf.zip').extractall(r'tmp\f8bdf')"
-```
+## 选字策略与覆盖率
 
-然后两步（都带自检，不一致就报错退出）：
+完整的中日韩 8px 点阵字库有 2.7 万多个字形，体积比 MCU 芯片总容量还大得多。
+所以字库用**按 Flash 预算筛选**的策略挑字：
 
-```powershell
-.\.venv\Scripts\python.exe infer\font\select_subset.py   # BDF + 语料 -> subset_8x8.txt
-.\.venv\Scripts\python.exe infer\c\tools\gen_font.py     # subset_8x8.txt -> infer/c/generated/nm_font.c / .h
-```
+- **ASCII 基础字符**：全部 95 个可打印 ASCII 字符（`0x20` ~ `0x7E`）无条件收全；
+- **常用中文字符**：按 SFT 对话语料里 Bot 回复的字符频次从高到低取，在设定的 Flash 预算内尽量多收，最后定了 635 个汉字；
+- **总字库容量**：**730 个字符**，对实际训练语料的字符覆盖率是 **98.72%**。
 
-`select_subset.py` 需要 BDF 与语料，`gen_font.py` 只需要 `subset_8x8.txt`；
-所以干净 clone（没有 BDF 也没有语料）也能重新生成 C 字库。改容量只动 `--budget` 一个参数
-（单位是打包后点阵 + 码点表的字节数）。
+---
 
-## 存法
+## 紧凑位流压缩编码设计
 
-- 8x8 格里，实测这批字形**第 0 行与第 7 列恒空**，所以每字只存 7 行 x 7 列 = **49 位**
-  （行内 bit7..bit1 是第 0..6 列）。摆格后只要哪一行越界或第 7 列非空，选字脚本直接报错。
-- 这 49 位**紧密打包成位流**，不是每行 1 字节 —— 每字 6.125 B。表尾补 1 个 0 字节当哨兵，
-  因为解包固定读「当前字节 + 下一个字节」（`nm_font_read7` 用 16 位窗口右移取 7 位）。
-- 码点表按升序存成「首个绝对 + 之后增量」的 LEB128 流，730 字只花 766 B。
-- 查表是顺序扫描 + 提前退出（码点升序，超过目标就停），字库外与非法 UTF-8 都写兜底字形
-  （7x7 空心方框）。接口是「解包到调用方给的 7 字节缓冲」：`nm_font_glyph(cp, out)` /
-  `nm_font_glyph_utf8(s, n, out)`，OLED 驱动拿到一个完整字符后调后者即可。
+为了在有限空间里塞进更多汉字，字库设计了一套紧凑编码：
 
-## 容量账本（实测，Cortex-M3 clang -Oz）
+1. **有效点阵裁剪**：
+   统计发现，这批 8x8 字符按规范摆进格子后，第 0 行和第 7 列永远是空白。所以每个字形实际只存 7 行 × 7 列 = **49 位有效像素**。
+2. **紧密位流拼接**：
+   49 位数据不做字节对齐，而是首尾相接压进一条连续位流，平均每个字只占 6.125 字节（730 个字一共 4,473 字节）。
+3. **LEB128 差分码点索引**：
+   把字符的 Unicode 码点按升序排好，只存相邻码点的差值（Delta Encoding），再用 LEB128 变长整数编码，730 字的索引表一共只花 766 字节。
+4. **字库总 Flash 开销**：
+   点阵位流 (4,473 B) + 码点索引 (766 B) + 兜底字符 (7 B) = **5,246 字节**（算上 C 解码函数总共约 5.6 KB）。
 
-| 项 | 字节 |
-|---|---|
-| 点阵位流 4,473 + 码点表 766 + 兜底 7 | 5,246 |
-| 查表代码（`nm_font_glyph` / `nm_font_glyph_utf8`，含内联的 `nm_font_read7`） | 380 |
-| **字库合计** | **5,626** |
+---
 
-整机 Flash **65,266 B**，64 KiB 余 **270 B**；RAM 不变（字库全在 Flash）。
-账本由 `infer/firmware/build_firmware.py` 真链接量出，不是估算。
+## 重新生成字库与构建
 
-## 为什么是 730 字
-
-选字规则：**可打印 ASCII（0x20..0x7E）无条件收录**（95 个），其余取语料 bot 侧的字符按词频降序，
-在 `--budget` 的字节上限内能塞多少塞多少 —— 上限按打包后的实际占用算
-（`packed_size(n) + varint_size(cps)`），不是按 7 字节/字的原样。
-
-| 方案 | 点阵 + 码点表 | 语料字符覆盖 | 整条回复可完整渲染 |
-|---|---|---|---|
-| 频率前 357 字（budget 2,900，未打包） | 2,899 B | 89.98% | 25.12% |
-| 频率前 422 字（budget 3,412，未打包） | 3,412 B | 92.67% | 40.63% |
-| **ASCII 95 + 中文 635 = 730 字（当前，budget 5,240，打包后）** | **5,239 B** | **98.72%** | 见下面方框率 |
-
-模型真实输出侧（38 条演示/泛化问答共 735 字符）：**演示 20 条零方框**，全体还剩 **17 个方框（2.31%）**，
-全是模型跑飞时吐的**语料外**字符（`✉䜈丆享兌含坸戩攀槠聜裉蹸躬辜酌龼`）—— 全量字库也覆盖不到，
-所以兜底字形无论如何都要有。
-
-之前要全量还差 2,206 B，靠这几步**无损**优化腾出来（每步都单独提交、逐位可验）：
-
-| 优化 | 省 |
-|---|---|
-| 描述符 `nm_mat` 的指针改统一权重池 `nm_pool` 的 uint16 偏移（12 B → 8 B） | 428 B |
-| 字库点阵 7 字节/字 → 49 位/字紧密打包 | 368 B |
-| exp / log1p 两张 Q15 表改二阶差分位流，运行期纯整数展开 | 772 B |
-| 上板 CFLAGS 补 `-ffunction-sections -fdata-sections`，`--gc-sections` 不再空转 | 256 B |
-
-权重侧已经榨干：int8 码的字节熵实测 7.722 bit（均匀是 8.0），无损压缩上限只有 3.5%，
-而且要在内层 GEMV 循环里解压，得不偿失。`.ARM.exidx` 那 496 B 已经落地（见 `firmware/m3.ld`）。
-
-## 测试
+如果要按新语料调整收录的字，或者增减预算，跑下面这套工具链：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest infer\tests\test_font.py -q
+# 1. 运行选字脚本（依据 BDF 源字库与训练语料，按预算生成选字子集清单）
+.\.venv\Scripts\python.exe infer\font\select_subset.py
+
+# 2. 运行打包脚本（将 subset_8x8.txt 打包生成 C 语言紧凑位流源文件）
+.\.venv\Scripts\python.exe infer\c\tools\gen_font.py
 ```
 
-- 生成的 C 字库 == `subset_8x8.txt` == BDF 原件，逐位一致（BDF 不在时那条 skip）；
-  C 里的位流会被反解回 7 字节/字再逐位比。
-- `infer/c/selftest/nm_font_selftest.c`：码点表严格升序、每个字形都能解包、解包后按同一口径**重新打包**
-  必须与位流逐位相同（重新打包那份用逐位写入独立写一遍，不是自洽比较）、字库外与非法 UTF-8 给兜底。
+*生成产物是 `infer/c/generated/nm_font.c` 和 `infer/c/generated/nm_font.h`。*
+
+---
+
+## 接口与渲染兜底
+
+- **解码 API**：提供 `nm_font_glyph(uint32_t cp, uint8_t out[7])`（按码点解码）和 `nm_font_glyph_utf8(const char *s, int n, uint8_t out[7])`（流式 UTF-8 解码）；
+- **兜底渲染保证**：输入里出现字库外的生僻字、非法 UTF-8 序列，或者模型生成的乱码时，解码器统一返回 7x7 像素的空心方框点阵（`nm_font_fallback`），保证前端的显存排版游标能平稳往下走，不会因此中断。

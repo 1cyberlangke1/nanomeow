@@ -1,0 +1,39 @@
+nanomeow
+Copyright 2026 1cyberlangke1
+
+本产品在实现时改写了下列项目的代码，按各自许可证的要求在此声明来源与许可。
+
+1. Mini_RWKV_7 — https://github.com/Alic-Li/Mini_RWKV_7
+   Licensed under the Apache License, Version 2.0（版权声明见上游仓库）。
+   改写范围：train/src/model.py、train/src/wkv7/（wkv7_cuda.cu、wkv7_op.cpp、wkv7_cuda.py）、
+   infer/ref/ 的定点前向。
+
+2. pytorch/ao (torchao) — https://github.com/pytorch/ao
+   Licensed under the BSD 3-Clause License。改写范围：train/src/qat.py（只保留对称 int8 分支）。
+   许可证全文：
+
+   Copyright 2023 Meta
+   All contributions by Arm:
+   Copyright (c) 2024-2026 Arm Limited and/or its affiliates
+
+   Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+   1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+   2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+   3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+3. ARM CMSIS-NN — https://github.com/ARM-software/CMSIS-NN
+   Licensed under the Apache License, Version 2.0。
+   参考范围：int8 推理里 requant 的取整与饱和规则（per-row 乘子 + 移位），未复制其代码。
+
+4. fusion-pixel-font — https://github.com/TakWolf/fusion-pixel-font
+   MisekiBitmap — https://github.com/ItMarki/MisekiBitmap
+   Licensed under the SIL Open Font License 1.1。
+   infer/c/generated/nm_font.c 与 infer/font/subset_8x8.txt 是从 fusion-pixel-font 的 8px 等宽
+   BDF 中选出的字形子集，属于该字体的派生数据，按 OFL-1.1 分发；许可原件见 infer/font/licenses/。
+
+5. 语料 train/data/chitchat_para.jsonl 为本项目自建的合成寒暄数据，不含第三方语料。

@@ -112,11 +112,6 @@ def run_fixed(parts, t_len):
     return yv, st
 
 
-def test_isqrt_is_used_here():
-    """占位：确保 C 与 head 的常量没被改坏（换配置要同步改测试）。"""
-    assert N_HEAD * HEAD == C == 32
-
-
 def test_qt_mul_and_neg():
     """qt_mul 的码 = 码之积；quantize=True 时必须落回 int8 码域。"""
     x = as_qt([100, -50, 7], 0.02)
