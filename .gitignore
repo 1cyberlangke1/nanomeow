@@ -43,8 +43,14 @@ tmp/
 train/dataset/
 
 # 训练产物（checkpoint / inductor 编译缓存 / 日志）
-train/out/
-
+# 只放行最终交付的那一份权重：干净 clone 也能直接跑 G1 逐位对拍与重导出，
+# 其余中间快照与 compile_cache 继续不入库。
+train/out/*
+!train/out/sft_fix3/
+train/out/sft_fix3/*
+!train/out/sft_fix3/sft.pth
+!train/out/sft_fix3/sft_step3000.pth
+!train/out/sft_fix3/sft_train.json
 # Python 虚拟环境 / 缓存
 .venv/
 __pycache__/
