@@ -110,3 +110,42 @@ def test_fixed_layer_matches_python(tmp_path):
     assert len(got) == len(expect)
     for i, (g, e) in enumerate(zip(got, expect)):
         assert g == e, "第 %d 条不一致：C=%s Python=%s（%s）" % (i, g, e, cases[i])
+
+@pytest.mark.skipif(GCC is None, reason="需要 gcc 才能编译 C 引擎")
+def test_u128_shr_round_matches_python(tmp_path):
+    """nm_u128_shr_round 对拍：热路（hi == 0 且 1 <= k < 64）与冷路（hi != 0 或 k >= 64）
+    都要盖到 —— 真实模型数据只走热路，冷路靠这条测试守。
+
+    预期行为：C 侧 == round_div((hi << 64) | lo, 1 << k)，逐位相同。用例只取「结果装得进
+    uint64」的合法输入（x < 2^(64+k)），这也是引擎里所有调用点的前提；k 上限取 127，
+    因为 C 侧对 k >= 128 按既有约定直接返回 0（那条分支在本模型的指数域里到不了）。
+    """
+    rng = random.Random(20261005)
+    cases, expect = [], []
+
+    def emit(hi, lo, k):
+        e = round_div((hi << 64) | lo, 1 << k)
+        if e >= 1 << 64:
+            return                             # 结果装不进 uint64，超出本函数契约，跳过
+        cases.append("shr %d %d %d" % (hi, lo, k))
+        expect.append("%d" % e)
+
+    for _ in range(200):                       # 热路：hi == 0
+        emit(0, rng.randrange(1 << 64), rng.randrange(1, 64))
+    for _ in range(200):                       # 冷路：hi != 0，k >= 64
+        emit(rng.randrange(1, 1 << 64), rng.randrange(1 << 64), rng.randrange(64, 128))
+    for _ in range(100):                       # 冷路边角：hi != 0 且 k < 64，结果刚好在 64 位内
+        k = rng.randrange(1, 64)
+        x = rng.randrange(1 << 64, 1 << (64 + k))
+        emit(x >> 64, x & ((1 << 64) - 1), k)
+    for hi in (0, 1, (1 << 64) - 1):           # 边界值
+        for lo in (0, 1, (1 << 64) - 1, 1 << 63):
+            for k in (1, 32, 63, 64, 65, 127):
+                if hi and k < 64 and (hi << 64 | lo) >= 1 << (64 + k):
+                    continue
+                emit(hi, lo, k)
+
+    got = _run(_build(tmp_path), cases)
+    assert len(got) == len(expect)
+    for i, (g, e) in enumerate(zip(got, expect)):
+        assert g == e, "第 %d 条不一致：C=%s Python=%s（%s）" % (i, g, e, cases[i])

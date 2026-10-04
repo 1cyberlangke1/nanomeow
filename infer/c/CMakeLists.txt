@@ -21,6 +21,10 @@ target_include_directories(nanomeow PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(nm_chat nm_chat.c)
 target_link_libraries(nm_chat PRIVATE nanomeow)
 
+# 主机吞吐基准：只量 nm_forward_token 的周期/token（主机口径，见文件头注释）
+add_executable(nm_bench nm_bench.c)
+target_link_libraries(nm_bench PRIVATE nanomeow)
+
 add_executable(nm_engine_selftest nm_engine_selftest.c)
 target_link_libraries(nm_engine_selftest PRIVATE nanomeow)
 

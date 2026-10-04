@@ -53,6 +53,10 @@ int main(void)
             long long v, num;
             if (scanf("%lld %lld", &v, &num) != 2) return 2;
             printf("%lld\n", (long long)nm_requant_code(v, num));
+        } else if (strcmp(op, "shr") == 0) {         /* u128_shr_round(hi, lo, k) */
+            unsigned long long hi, lo, k;
+            if (scanf("%llu %llu %llu", &hi, &lo, &k) != 3) return 2;
+            printf("%llu\n", (unsigned long long)nm_u128_shr_round(hi, lo, (int)k));
         } else if (strcmp(op, "nsf") == 0) {         /* scale_from_frac(f) */
             long long f;
             if (scanf("%lld", &f) != 1) return 2;
