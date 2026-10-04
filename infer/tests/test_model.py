@@ -1,5 +1,6 @@
 """INT8 引擎的整模型对拍：state 换单位与 G2 困惑度闸门。"""
 
+import json
 import math
 import pathlib
 import sys
@@ -8,14 +9,16 @@ import pytest
 import torch
 
 HERE = pathlib.Path(__file__).resolve()
+sys.path.insert(0, str(HERE.parents[0]))
 sys.path.insert(0, str(HERE.parents[1]))
 sys.path.insert(0, str(HERE.parents[2] / "train"))
 
+from _ckpt import latest_ckpt  # noqa: E402
 from ref.fixed import mul, normalize, value  # noqa: E402
 from ref.int8_model import QTensor  # noqa: E402
 from ref.wkv7 import wkv7_recurrence  # noqa: E402
 
-CKPT = HERE.parents[2] / "train" / "out" / "sft_v2" / "sft.pth"
+CKPT = latest_ckpt()
 N = 2                      # 测试用的 head_size
 Q7 = normalize(1, -7)      # 值 = 2^-7 的 scale（激活 / 向量）
 Q9 = normalize(1, -9)      # 第一趟的 k / v：step = 2^-18
@@ -66,42 +69,69 @@ def test_recurrence_rescales_state_to_new_step():
     assert float((bad - ref).abs().max()) / value(step2) > 5.0, (bad - ref).abs().max() / value(step2)
 
 
-@pytest.mark.skipif(not CKPT.exists(), reason="需要训练产出的 checkpoint")
+@pytest.mark.skipif(CKPT is None, reason="需要训练产出的 checkpoint")
 def test_g2_ppl_degradation_within_5pct():
-    """G2 闸门：int8 引擎与同权重 bf16 前向的困惑度退化必须 ≤ 5%。
+    """G2 闸门：int8 引擎相对同权重浮点前向的困惑度退化必须 ≤ 5%。
 
-    预期行为：同一段字节上，引擎逐 token 前向的 nats/byte 相对 bf16 全序列前向
-              不超过 5%；两侧 logits 的 argmax 允许有差异（量化误差），所以只卡困惑度。
+    口径（都是实测定的，不是估计）：
+    - 数据取**对话域内的真实样本**（`train/data/chitchat_para.jsonl` 的 user:/bot: 行）。
+      不能取语料文件的前 512 字节——那是 JSON 残片、两侧都接近均匀分布，闸门没有鉴别力。
+    - ① 用户口径：整条序列的 nats/byte，int8 相对 bf16 原样前向 ≤ 5%。
+    - ② 忠实性口径：答案段（唯一进了 loss、也是部署真正在意的区域）int8 相对
+      「训练时真正优化的那个函数」（同权重 + QAT 假量化）≤ 5%。实测 int8 比它还好，
+      所以这条抓的是「定点实现自己引入退化」这类回归。
+    - ③ 绝对护栏：答案段 int8 与 bf16 原样的差 ≤ 0.01 nats/byte。该段 nll 只有 0.008
+      量级，相对百分比会被小基数放大（实测 +20%），所以这里卡绝对值而不是百分比。
     """
     from ref.model import Int8Model
     from ref.weights import load_weights
     from src.config import NanoConfig
+    from src.data import answer_start
     from src.model import NanoRWKV
+    from src.qat import prepare_qat
+    from src.tokenizer import ETX_ID
 
     cfg, wts = load_weights(str(CKPT))
     eng = Int8Model(cfg, wts)
     ckpt = torch.load(str(CKPT), map_location="cpu", weights_only=False)
-    plain = NanoRWKV(NanoConfig(**ckpt["nano_cfg"]))
-    plain.load_state_dict(ckpt["model"])
-    plain = plain.to(torch.bfloat16).eval()
 
-    data = (HERE.parents[2] / "train" / "data" / "chitchat_seed.jsonl").read_text(
-        encoding="utf-8").encode("utf-8")[:512]
-    toks = list(data)
+    def build(qat):
+        """输入：是否打开 QAT 假量化；输出：对应的 bf16 模型。"""
+        m = NanoRWKV(NanoConfig(**ckpt["nano_cfg"]))
+        m.load_state_dict(ckpt["model"])
+        if qat:
+            prepare_qat(m)
+        return m.to(torch.bfloat16).eval()
 
-    with torch.no_grad():
-        lg = plain(torch.tensor([toks], dtype=torch.long))[0][0].float()
-    tot_b = 0.0
-    for t in range(len(toks) - 1):
-        tot_b -= float(torch.log_softmax(lg[t], dim=-1)[toks[t + 1]])
-    nll_b = tot_b / (len(toks) - 1)
+    plain, quant = build(False), build(True)
+    rows = [json.loads(l)["text"] for l in open(
+        HERE.parents[2] / "train" / "data" / "chitchat_para.jsonl", encoding="utf-8")]
+    step = max(1, len(rows) // 24)
+    rows = rows[::step][:24]
 
-    st = eng.zeros_state()
-    tot_i = 0.0
-    for t in range(len(toks) - 1):
-        out = eng.forward_token(toks[t], st)
-        z = torch.tensor([c * value(out.scale) for c in out.codes], dtype=torch.float32)
-        tot_i -= float(torch.log_softmax(z, dim=-1)[toks[t + 1]])
-    nll_i = tot_i / (len(toks) - 1)
-
-    assert nll_i / nll_b - 1.0 <= 0.05, (nll_b, nll_i, math.exp(nll_b), math.exp(nll_i))
+    seq_b = seq_i = ans_b = ans_q = ans_i = 0.0
+    n_seq = n_ans = 0
+    for r in rows:
+        toks = list(r.encode("utf-8"))[:200] + [ETX_ID]
+        lo, hi = max(0, answer_start(toks) - 1), len(toks) - 2
+        with torch.no_grad():
+            lg = plain(torch.tensor([toks], dtype=torch.long))[0][0].float()
+            lq = quant(torch.tensor([toks], dtype=torch.long))[0][0].float()
+        state = eng.zeros_state()
+        outs = [eng.forward_token(toks[t], state) for t in range(len(toks) - 1)]
+        for t in range(len(toks) - 1):
+            b = -float(torch.log_softmax(lg[t], dim=-1)[toks[t + 1]])
+            out = outs[t]
+            z = torch.tensor([c * value(out.scale) for c in out.codes], dtype=torch.float32)
+            i = -float(torch.log_softmax(z, dim=-1)[toks[t + 1]])
+            seq_b += b
+            seq_i += i
+            n_seq += 1
+            if lo <= t < hi:
+                ans_b += b
+                ans_q -= float(torch.log_softmax(lq[t], dim=-1)[toks[t + 1]])
+                ans_i += i
+                n_ans += 1
+    assert seq_i / seq_b - 1.0 <= 0.05, (seq_b / n_seq, seq_i / n_seq)
+    assert ans_i / ans_q - 1.0 <= 0.05, (ans_b / n_ans, ans_q / n_ans, ans_i / n_ans)
+    assert ans_i - ans_b <= 0.01 * n_ans, (ans_b / n_ans, ans_i / n_ans)

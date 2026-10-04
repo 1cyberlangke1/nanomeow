@@ -104,8 +104,8 @@ def collect(model):
     return items
 
 
-def export(model, out_path):
-    """输入：模型、头文件路径；输出：统计字典（同时写头文件）。"""
+def export(model, out_path, source=""):
+    """输入：模型、头文件路径、权重来源 checkpoint 描述；输出：统计字典（同时写头文件）。"""
     fq_row = IntxFakeQuantizer(per_row_int8())
     fq_ten = IntxFakeQuantizer(per_tensor_int8())
 
@@ -147,6 +147,7 @@ def export(model, out_path):
         fh.write("#endif\n")
     with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("/* 自动生成，请勿手改：train/scripts/export_int8.py */\n")
+        fh.write("/* 权重来源：%s */\n" % (source or "(未知)"))
         fh.write("#ifndef NANOMEOW_WEIGHTS_H\n#define NANOMEOW_WEIGHTS_H\n")
         fh.write("#include <stdint.h>\n#include \"model_cfg.h\"\n\n")
         fh.write("/* 每个张量：int8 码 + 每行 int32 乘子 + int8 移位，值 = 码 * (乘子 * 2^移位)；符号前缀 nmw_ = nano-meow weights */\n")
@@ -194,7 +195,7 @@ def main():
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    stats = export(model, pathlib.Path(args.out))
+    stats = export(model, pathlib.Path(args.out), args.ckpt)
     scale_bytes = stats["scales"] * 5
     print("[cfg] n_layer=%d n_embd=%d head_size=%d dim_ffn=%d dynamic_decay=%s"
           % (cfg.n_layer, cfg.n_embd, cfg.head_size, cfg.dim_ffn, cfg.dynamic_decay))

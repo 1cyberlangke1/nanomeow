@@ -18,16 +18,18 @@ import pytest
 
 HERE = pathlib.Path(__file__).resolve()
 REPO = HERE.parents[2]
+sys.path.insert(0, str(HERE.parents[0]))
 sys.path.insert(0, str(HERE.parents[1]))
 sys.path.insert(0, str(REPO / "train"))
 
+from _ckpt import latest_ckpt  # noqa: E402
 from ref.model import Int8Model  # noqa: E402
 from ref.weights import load_weights  # noqa: E402
 from src.generate import build_prompt  # noqa: E402
 from src.tokenizer import ETX_ID, UTF8StreamDecoder, encode  # noqa: E402
 
 C_DIR = HERE.parents[1] / "c"
-CKPT = REPO / "train" / "out" / "sft_v2" / "sft.pth"
+CKPT = latest_ckpt()
 GCC = shutil.which("gcc")
 Q16 = 65536
 PEN_13 = 85197          # round(1.3 * 2^16)，与 Python 侧用同一个整数
@@ -131,7 +133,7 @@ def run_chat(exe, prompt_bytes, max_new_tokens, pen_q16=Q16, window=0):
 
 
 @pytest.mark.skipif(GCC is None, reason="需要 gcc 才能编译 C 引擎")
-@pytest.mark.skipif(not CKPT.exists(), reason="需要训练产出的 checkpoint")
+@pytest.mark.skipif(CKPT is None, reason="需要训练产出的 checkpoint")
 def test_c_generate_matches_python_bitwise(chat_exe):
     """逐位对拍：同一 prompt 下 C 与 Python 参考生成的文本完全相同，且没有定点越界。"""
     cfg, wts = load_weights(str(CKPT))
@@ -146,7 +148,7 @@ def test_c_generate_matches_python_bitwise(chat_exe):
 
 
 @pytest.mark.skipif(GCC is None, reason="需要 gcc 才能编译 C 引擎")
-@pytest.mark.skipif(not CKPT.exists(), reason="需要训练产出的 checkpoint")
+@pytest.mark.skipif(CKPT is None, reason="需要训练产出的 checkpoint")
 def test_c_generate_matches_python_with_window(chat_exe):
     """换一组参数（关惩罚 + 滑动窗口）再对拍一次，覆盖历史环形的淘汰路径。"""
     cfg, wts = load_weights(str(CKPT))
@@ -159,7 +161,7 @@ def test_c_generate_matches_python_with_window(chat_exe):
 
 
 @pytest.mark.skipif(GCC is None, reason="需要 gcc 才能编译 C 引擎")
-@pytest.mark.skipif(not CKPT.exists(), reason="需要训练产出的 checkpoint")
+@pytest.mark.skipif(CKPT is None, reason="需要训练产出的 checkpoint")
 def test_c_generate_no_mojibake(chat_exe):
     """不乱码：严格 UTF-8 解码通过、不含 U+FFFD，而且真的吐出了中文。"""
     prompt = _bytes(build_prompt("今天怎么样"))

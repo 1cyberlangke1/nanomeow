@@ -15,14 +15,16 @@ import pytest
 
 HERE = pathlib.Path(__file__).resolve()
 REPO = HERE.parents[2]
+sys.path.insert(0, str(HERE.parents[0]))
 sys.path.insert(0, str(HERE.parents[1]))
 sys.path.insert(0, str(REPO / "train"))
 
+from _ckpt import latest_ckpt  # noqa: E402
 from ref.model import Int8Model  # noqa: E402
 from ref.weights import load_weights  # noqa: E402
 
 C_DIR = HERE.parents[1] / "c"
-CKPT = REPO / "train" / "out" / "sft_v2" / "sft.pth"
+CKPT = latest_ckpt()
 DATASET = REPO / "train" / "dataset" / "nana_clean.jsonl"
 GCC = shutil.which("gcc")
 # 一段真实的对话字节（user:你好\nbot: 的开头），覆盖多字节 UTF-8 与 ASCII
@@ -61,7 +63,7 @@ def run_engine(exe, tokens):
 
 
 @pytest.mark.skipif(GCC is None, reason="需要 gcc 才能编译 C 引擎")
-@pytest.mark.skipif(not CKPT.exists(), reason="需要训练产出的 checkpoint")
+@pytest.mark.skipif(CKPT is None, reason="需要训练产出的 checkpoint")
 def test_c_engine_matches_python_bitwise(engine_exe):
     """逐位对拍：每一步的 logits 码与 scale 与 Python 参考完全一致，且没有触发溢出哨兵。"""
     steps, range_error = run_engine(engine_exe, TOKENS)
@@ -89,7 +91,7 @@ def long_tokens():
 
 
 @pytest.mark.skipif(GCC is None, reason="需要 gcc 才能编译 C 引擎")
-@pytest.mark.skipif(not CKPT.exists(), reason="需要训练产出的 checkpoint")
+@pytest.mark.skipif(CKPT is None, reason="需要训练产出的 checkpoint")
 @pytest.mark.skipif(not DATASET.exists(), reason="需要清洗后的语料")
 def test_c_engine_long_context_bitwise(engine_exe):
     """512 token 长上下文的逐位对拍。
