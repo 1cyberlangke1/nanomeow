@@ -24,14 +24,22 @@
 #define NM_VOCAB NMW_VOCAB
 #define NM_CTX_LEN NMW_CTX_LEN
 
-/* 一层张量：per-row 权重给 rows 行 scale，per-tensor 常量给 1 个。 */
+/* 一层张量：per-row 权重给 rows 行 scale，per-tensor 常量给 1 个。
+ * codes 是 int8 码；idx_bits > 0 时它指向「去重后的唯一行池」，逻辑第 row 行要先过索引表
+ * （索引表紧跟在 scale 位流末尾，见 nm_row_codes）。scale 是位流，口径见 gen_weights.py：
+ *   per-tensor：4 B 小端，(尾数 23 位) << 7 | (shift + 127)；
+ *   per-row   ：[尾数 23 位打包][1 B 基线 shift][1 B 增量位宽 w][增量 w 位打包][索引 idx_bits 位打包]。
+ * 尾数最高位恒 1、每张量的 shift 又几乎不变，这两条前提让 scale 表从 6,516 B 压到约 5.5 KB；
+ * 行去重再把权重码省约 1.5 KB。两项都是无损的，运行期按需解出当前行的那一份。
+ * rows/cols/per_row/idx_bits 收成位域 —— 四项合计仍是一个 32 位字，描述符保持 12 B。
+ * rows/cols 上限 511，超出时生成器会先报错，不会静默截断。 */
 typedef struct {
     const int8_t *codes;
-    const int32_t *mul;
-    const int8_t *shift;
-    int rows;
-    int cols;
-    int per_row;
+    const uint8_t *scale;
+    uint32_t rows : 9;
+    uint32_t cols : 9;
+    uint32_t per_row : 1;
+    uint32_t idx_bits : 4;
 } nm_mat;
 
 typedef struct {

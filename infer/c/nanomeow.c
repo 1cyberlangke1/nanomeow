@@ -89,12 +89,12 @@ static void nm_finish(const int64_t *vals, int n, int quantize, nm_tensor *out)
     }
 }
 
-/* 输入：张量、长度；输出：无。预期行为：就地 per-tensor 动态量化（= fq_act）。 */
+/* 输入：张量、长度；输出：无。预期行为：就地 per-tensor 动态量化（= fq_act）。
+ *           量化只按元素「读旧码、写新码」，num 在循环外就定好，所以能直接原地做 ——
+ *           省掉一次 n * 8 字节的整表拷贝（原来先写 tmp 再 memcpy 回来）。 */
 static void nm_fq(nm_tensor *x, int n)
 {
-    int64_t tmp[NM_MAX_DIM];
-    nm_quantize_dynamic(x->v, n, x->scale, tmp, &x->scale);
-    memcpy(x->v, tmp, (size_t)n * sizeof(int64_t));
+    nm_quantize_dynamic(x->v, n, x->scale, x->v, &x->scale);
 }
 
 /* 输入：张量 a、b；输出：无。预期行为：把 b 原样拷进 a（含 scale）。 */
@@ -104,14 +104,64 @@ static void nm_copy(nm_tensor *dst, const nm_tensor *src, int n)
     dst->scale = src->scale;
 }
 
-/* 输入：权重矩阵、行号；输出：该行的 scale。per-row 取第 row 行、per-tensor 恒取第 0 个。 */
+/* 输入：字节流、起始位号、位宽 n（1..24）；输出：从该位起、小端位序的 n 位无符号值。
+ * 预期行为：只读 ceil((bitpos % 8 + n) / 8) 个字节 —— 位流末尾的那一条不会越界读。
+ *           另一种写法是「一次 32 位非对齐读」，交替 A/B 实测只快 1.0%（337.3K vs
+ *           340.7K cycles/token），却要多留 3 B 填充，所以这里不用它。 */
+static uint32_t nm_read_bits(const uint8_t *p, uint32_t bitpos, uint32_t n)
+{
+    uint32_t off = bitpos & 7u, nb = (n + off + 7u) >> 3, acc = 0, i;
+    const uint8_t *q = p + (bitpos >> 3);
+    for (i = 0; i < nb; i++) acc |= (uint32_t)q[i] << (8u * i);
+    return (acc >> off) & ((1u << n) - 1u);
+}
+
+/* 输入：per-row 的 scale 位流、行数；输出：行索引段相对位流开头的字节偏移。
+ * 预期行为：布局 = [ceil(rows*23/8) 尾数][1 B 基线][1 B 增量位宽 w][ceil(rows*w/8) 增量][索引]，
+ *           段偏移全部由 rows 与 w 现算，所以描述符里不必再存一个偏移字段。 */
+static uint32_t nm_index_off(const uint8_t *p, uint32_t rows)
+{
+    uint32_t mb = (rows * 23u + 7u) >> 3;
+    uint32_t w = p[mb + 1];
+    return mb + 2u + (w ? ((rows * w + 7u) >> 3) : 0u);
+}
+
+/* 输入：权重矩阵、行号；输出：该行的 scale。per-row 取第 row 行、per-tensor 恒取第 0 个。
+ * 预期行为：把位流还原成 (mul, shift)。mul = (2^23 + 尾数 23 位) << 7 —— 归一化后最高位
+ *           恒 1，不必存；shift = 每张量的基线 + 行内小位宽增量（位宽 0 表示整张量同一个值）。 */
 static nm_scale nm_row_scale(const nm_mat *m, int row)
 {
     nm_scale s;
-    int idx = m->per_row ? row : 0;
-    s.m = m->mul[idx];
-    s.e = m->shift[idx];
+    if (!m->per_row) {
+        const uint8_t *q = m->scale;
+        uint32_t v = (uint32_t)q[0] | ((uint32_t)q[1] << 8)
+                     | ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
+        s.m = (int32_t)(((v >> 7) | (1u << 23)) << 7);
+        s.e = (int8_t)((v & 0x7Fu) - 127u);
+        return s;
+    }
+    {
+        const uint8_t *p = m->scale;
+        uint32_t rows = (uint32_t)m->rows, mb = (rows * 23u + 7u) >> 3;
+        uint32_t w = p[mb + 1];
+        uint32_t sh = (uint32_t)(int32_t)(int8_t)p[mb];
+        if (w) sh += nm_read_bits(p + mb + 2u, (uint32_t)row * w, w);
+        s.m = (int32_t)((nm_read_bits(p, (uint32_t)row * 23u, 23u) | (1u << 23)) << 7);
+        s.e = (int8_t)sh;
+    }
     return s;
+}
+
+/* 输入：权重矩阵、行号；输出：该行 int8 码的首地址。
+ * 预期行为：idx_bits = 0 时第 row 行就是连续排布的第 row 行；否则 codes 是去重后的唯一行池，
+ *           行号先经位流末尾的索引表映射 —— 省 Flash 的代价是每次取行多一次位流解码。 */
+static const int8_t *nm_row_codes(const nm_mat *m, int row)
+{
+    uint32_t idx = (uint32_t)row;
+    if (m->idx_bits)
+        idx = nm_read_bits(m->scale + nm_index_off(m->scale, (uint32_t)m->rows),
+                           (uint32_t)row * m->idx_bits, m->idx_bits);
+    return m->codes + (size_t)idx * (uint32_t)m->cols;
 }
 
 /* 输入：per-tensor 权重（如 x_r / k_k / r_k）；输出：装成张量的它。 */
@@ -424,7 +474,7 @@ static void nm_linear(const nm_tensor *x, const nm_mat *m, int quantize, nm_tens
     for (j = 0; j < m->cols; j++) xs[j] = (int32_t)x->v[j];
     for (r = 0; r < m->rows; r++) {
         int32_t a = 0;
-        const int8_t *row = m->codes + (size_t)r * m->cols;
+        const int8_t *row = nm_row_codes(m, r);
         for (j = 0; j < m->cols; j++) a += (int32_t)row[j] * xs[j];
         acc[r] = a;
         sc[r] = nm_mul(nm_row_scale(m, r), x->scale);
@@ -462,7 +512,7 @@ static void nm_head_linear(const nm_tensor *x, const nm_mat *m, int8_t *codes, n
     }
     for (r = 0; r < m->rows; r++) {
         int32_t a = 0, sh;
-        const int8_t *row = m->codes + (size_t)r * m->cols;
+        const int8_t *row = nm_row_codes(m, r);
         nm_scale sc = nm_mul(nm_row_scale(m, r), x->scale);
         for (j = 0; j < m->cols; j++) a += (int32_t)row[j] * xs[j];
         sh = sc.e - e_ref;

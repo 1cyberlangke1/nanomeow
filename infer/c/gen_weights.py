@@ -3,9 +3,12 @@
 输入：infer/model_weights.h（由 train/scripts/export_int8.py 生成）、infer/c/nanomeow.h 与
       infer/c/nanomeow.c（用来统计引擎的运行期内存）。
 输出：infer/c/nm_weights.c（`nm_blocks[3]` 与四个顶层 `nm_mat` 的定义）。
-预期行为：把「int8 码 + 每行 int32 乘子 + 每行 int8 移位」装成 `nm_mat` ——
+预期行为：把「int8 码 + 每行乘子 + 每行移位」**无损压缩**后装成 `nm_mat` ——
           头文件里 `<符号>_mul` 是数组的是 per-row（rows = 乘子条数、cols = 码数 / rows），
           是标量的是 per-tensor（rows = 1、cols = 码数）。
+          压缩有两条，都能反解回原值（见 nanomeow.c 的 nm_row_scale / nm_row_codes）：
+          ① scale：尾数只存 23 位（最高位恒 1），移位按张量存 1 字节基线 + 行内小位宽增量；
+          ② 码：整张量行去重，只存唯一行池 + 每行索引（索引表跟在 scale 位流后面）。
           文件头的注释由实际参数统计出来：每个导出权重的名字与字节数、权重合计、
           Flash 常驻表大小、RAM（状态 + 引擎工作区）大小，全部现算，不写死。
           生成前自检：3 层每个字段都找得到、码数能被行数整除，否则报错退出。
@@ -70,8 +73,121 @@ TOP_FIELDS = (("nm_emb_weight", "nmw_emb_weight"),
               ("nm_ln_out_bias", "nmw_ln_out_bias"),
               ("nm_head_weight", "nmw_head_weight"))
 
-EMPTY_MAT = "{NULL, NULL, NULL, 0, 0, 0}"
-SCALE_BYTES = 5          # 一条 scale = int32 乘子 + int8 移位
+EMPTY_MAT = "{NULL, NULL, 0, 0, 0, 0}"
+
+
+def int_list(text, sym):
+    """输入：头文件文本、符号名；输出：该符号的整数列表（数组与标量都归一成 list），
+    符号不存在时返回 None。预期行为：与 parse_header 用同一套正则，只是多取了值。"""
+    m = re.search(r"static const \w+ %s\[\] = \{([^{}]*)\};" % re.escape(sym), text)
+    if m:
+        return [int(x) for x in m.group(1).replace("\n", " ").split(",") if x.strip()]
+    m = re.search(r"static const \w+ %s = (-?\d+);" % re.escape(sym), text)
+    if m:
+        return [int(m.group(1))]
+    return None
+
+
+MANT_BITS = 23      # 归一化后尾数最高位恒 1，只存低 23 位
+SHIFT_BITS = 7      # shift ∈ [-127, 0]，存 shift + 127
+
+
+def mantissa(mul, sym):
+    """输入：乘子、符号名；输出：归一化尾数（23 位，去掉恒 1 的最高位）。
+
+    预期行为：mul 实测恒在 [2^30, 2^31) 且至少有 7 个尾零，所以 mul = (2^23 + mant) << 7。
+              前提不成立直接报错，不静默截断。
+    """
+    if mul <= 0 or mul % 128:
+        raise SystemExit("自检失败：%s 的 mul=%d 不是 128 的正整数倍" % (sym, mul))
+    m24 = mul >> 7
+    if not (1 << 23) <= m24 < (1 << 24):
+        raise SystemExit("自检失败：%s 的 mul=%d 归一化后不在 [2^23, 2^24)" % (sym, mul))
+    return m24 - (1 << 23)
+
+
+def shift_value(sh, sym):
+    """输入：移位、符号名；输出：原值。预期行为：只接受 [-127, 0]，否则报错。"""
+    if not -127 <= sh <= 0:
+        raise SystemExit("自检失败：%s 的 shift=%d 超出 [-127, 0]" % (sym, sh))
+    return sh
+
+
+def bit_pack(values, width):
+    """输入：非负整数列表、位宽；输出：小端位序的字节串（最后 1 字节高位补 0）。
+
+    预期行为：第 i 个值占位 [i*width, (i+1)*width)，与 nanomeow.c 的 nm_read_bits 互逆。
+              width = 0 时输出空串。
+    """
+    if width == 0:
+        return b""
+    out, acc, nbits = bytearray(), 0, 0
+    for v in values:
+        acc |= (v & ((1 << width) - 1)) << nbits
+        nbits += width
+        while nbits >= 8:
+            out.append(acc & 0xFF)
+            acc >>= 8
+            nbits -= 8
+    if nbits:
+        out.append(acc & 0xFF)
+    return bytes(out)
+
+
+def pack_scale_tensor(mul, sh, sym):
+    """输入：乘子、移位、符号名；输出：per-tensor 的 4 B scale 位流。
+
+    预期行为：小端 32 位 = (尾数 23 位) << 7 | (shift + 127)，与 nm_row_scale 的
+              per-tensor 分支互逆。
+    """
+    v = (mantissa(mul, sym) << SHIFT_BITS) | (shift_value(sh, sym) + 127)
+    return bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
+
+
+def pack_scale_rows(muls, shifts, sym):
+    """输入：逐行乘子、逐行移位、符号名；输出：per-row 的 scale 位流。
+
+    预期行为：布局 = [尾数 23 位打包][1 B 基线 shift][1 B 增量位宽 w][增量 w 位打包]。
+              基线取整张量最小的 shift，增量非负；整张量同一个 shift 时 w = 0、不存增量。
+              与 nm_row_scale 的 per-row 分支互逆。
+    """
+    if len(muls) != len(shifts):
+        raise SystemExit("自检失败：%s 的 mul(%d) 与 shift(%d) 个数不一致"
+                         % (sym, len(muls), len(shifts)))
+    mants = [mantissa(mu, sym) for mu in muls]
+    shs = [shift_value(sh, sym) for sh in shifts]
+    base = min(shs)
+    deltas = [sh - base for sh in shs]
+    w = max(deltas).bit_length()
+    if w > 8:
+        raise SystemExit("自检失败：%s 的移位增量位宽 %d 超过 8" % (sym, w))
+    return (bit_pack(mants, MANT_BITS) + bytes([base & 0xFF, w])
+            + bit_pack(deltas, w))
+
+
+def plan_rows(codes, rows, cols):
+    """输入：int8 码、行数、列数；输出：(唯一行池, 索引位宽, 索引列表)，不去重时 None。
+
+    预期行为：唯一行数 uniq < rows 且索引表字节数严格小于省下的码字节数才去重；
+              索引位宽 b = (uniq - 1).bit_length()，索引表跟在 scale 位流后面。
+    """
+    if rows < 2 or cols < 2:
+        return None
+    pool, seen, idx = [], {}, []
+    for r in range(rows):
+        row = tuple(codes[r * cols:(r + 1) * cols])
+        if row not in seen:
+            seen[row] = len(pool)
+            pool.append(row)
+        idx.append(seen[row])
+    uniq = len(pool)
+    if uniq == rows:
+        return None
+    b = max(1, (uniq - 1).bit_length())   # 0 位会被运行期当成「没去重」，所以至少 1 位
+    if (rows * b + 7) // 8 >= (rows - uniq) * cols:
+        return None
+    flat = [v for row in pool for v in row]
+    return flat, b, idx
 
 
 def parse_header(text):
@@ -124,17 +240,22 @@ def display_name(sym):
     return prefix + rest
 
 
-def mat_expr(sym, lens, is_array):
-    """输入：符号名、元素个数表、数组标记表；输出：一个 nm_mat 初始化表达式。"""
+def mat_expr(sym, lens, is_array, idx_bits, pooled):
+    """输入：符号名、元素个数表、数组标记表、索引位宽、是否有唯一行池；输出：一个 nm_mat 表达式。
+
+    预期行为：有行池时 codes 指向去重后的池（nmwc_ 前缀），否则指向头文件里的原始码。
+    """
     if sym not in lens:
         raise SystemExit("自检失败：头文件里没有符号 %s" % sym)
     n = lens[sym]
+    pack = "nmwp_" + sym[len("nmw_"):]
+    codes = ("nmwc_" + sym[len("nmw_"):]) if pooled else sym
     if is_array.get(sym + "_mul", False):
         rows = lens[sym + "_mul"]
         if rows <= 0 or n % rows:
             raise SystemExit("自检失败：%s 的码数 %d 不是行数 %d 的整数倍" % (sym, n, rows))
-        return "{%s, %s_mul, %s_shift, %d, %d, 1}" % (sym, sym, sym, rows, n // rows)
-    return "{%s, &%s_mul, &%s_shift, 1, %d, 0}" % (sym, sym, sym, n)
+        return "{%s, %s, %d, %d, 1, %d}" % (codes, pack, rows, n // rows, idx_bits)
+    return "{%s, %s, 1, %d, 0, 0}" % (codes, pack, n)
 
 
 def parse_defines(text):
@@ -182,13 +303,43 @@ def workspace_bytes(engine, d):
 
 def main():
     """输入：无；输出：写 nm_weights.c 并在 stdout 打印一行摘要。"""
-    lens, is_array, order = parse_header(HEADER.read_text(encoding="utf-8"))
+    hdr = HEADER.read_text(encoding="utf-8")
+    lens, is_array, order = parse_header(hdr)
     d = parse_defines(CFG.read_text(encoding="utf-8"))
     work_bytes, work_n = workspace_bytes(ENGINE_C.read_text(encoding="utf-8"), d)
 
     tensors = [s for s in order if is_tensor(s, lens)]
-    code_total = sum(lens[s] for s in tensors)
-    scale_total = sum(lens[s + "_mul"] for s in tensors) * SCALE_BYTES
+    blobs, pools, idxbits = {}, {}, {}
+    code_total = 0
+    for sym in tensors:
+        muls = int_list(hdr, sym + "_mul")
+        shifts = int_list(hdr, sym + "_shift")
+        codes = int_list(hdr, sym)
+        if muls is None or shifts is None:
+            raise SystemExit("自检失败：%s 没有 mul/shift 分量" % sym)
+        if codes is None or len(codes) != lens[sym]:
+            raise SystemExit("自检失败：%s 的码数与头文件声明不一致" % sym)
+        rows, n = len(muls), lens[sym]
+        if rows <= 0 or n % rows:
+            raise SystemExit("自检失败：%s 的码数 %d 不是行数 %d 的整数倍" % (sym, n, rows))
+        cols = n // rows
+        idxbits[sym] = 0
+        if is_array.get(sym + "_mul", False):
+            blob = pack_scale_rows(muls, shifts, sym)
+            plan = plan_rows(codes, rows, cols)
+            if plan is None:
+                code_total += n
+            else:
+                flat, b, idx = plan
+                blob += bit_pack(idx, b)
+                pools[sym] = flat
+                idxbits[sym] = b
+                code_total += len(flat)
+        else:
+            blob = pack_scale_tensor(muls[0], shifts[0], sym)
+            code_total += n
+        blobs[sym] = blob
+    scale_total = sum(len(blobs[s]) for s in tensors)
     state_total = state_bytes(d) * d["NM_N_LAYER"]
 
     head = ["/* 自动生成，请勿手改：infer/c/gen_weights.py",
@@ -204,12 +355,15 @@ def main():
         if is_array.get(sym + "_mul", False):
             rows = lens[sym + "_mul"]
             kind = "per-row %d x %d" % (rows, lens[sym] // rows)
-            scale_n = rows
+            stored = lens[sym]
+            if sym in pools:
+                stored = len(pools[sym])
+                kind += "，去重成 %d 行" % (stored // (lens[sym] // rows))
         else:
             kind = "per-tensor %d" % lens[sym]
-            scale_n = 1
+            stored = lens[sym]
         head.append(" *   %-32s %6d B / %5d B  (%s)"
-                    % (display_name(sym), lens[sym], scale_n * SCALE_BYTES, kind))
+                    % (display_name(sym), stored, len(blobs[sym]), kind))
     head += [
         " *",
         " * 权重合计：码 %d B（%.1f KiB）+ scale 表 %d B（%.1f KiB）= %d B（%.1f KiB）"
@@ -228,7 +382,19 @@ def main():
     ]
 
     lines = head + ["", '#include <stddef.h>', '#include "../model_weights.h"', '#include "nanomeow.h"', "",
-                    "const nm_block nm_blocks[NM_N_LAYER] = {"]
+                    "/* 无损压缩后的 scale 位流（口径见 gen_weights.py，与 nanomeow.c 的",
+                    " * nm_row_scale / nm_row_codes 互逆）：per-tensor 是 4 B 小端；",
+                    " * per-row 是 [尾数 23 位][1 B 基线][1 B 增量位宽][增量][行索引]，",
+                    " * 行索引只在 idx_bits > 0（该张量的码被去重）时才有。原始的 nmw_*_mul /",
+                    " * nmw_*_shift、以及被去重张量的原始码都已没人引用，编译器会把它们丢掉。 */"]
+    for sym in tensors:
+        lines.append("static const uint8_t nmwp_%s[] = {%s};"
+                     % (sym[len("nmw_"):], ",".join(str(v) for v in blobs[sym])))
+    for sym in tensors:
+        if sym in pools:
+            lines.append("static const int8_t nmwc_%s[] = {%s};"
+                         % (sym[len("nmw_"):], ",".join(str(v) for v in pools[sym])))
+    lines += ["", "const nm_block nm_blocks[NM_N_LAYER] = {"]
     for layer in range(N_LAYER):
         lines.append("    { /* layer %d */" % layer)
         for field, suffix in BLOCK_FIELDS:
@@ -238,12 +404,13 @@ def main():
                     raise SystemExit("自检失败：第 %d 层缺字段 %s（%s）" % (layer, field, sym))
                 lines.append("        %s," % EMPTY_MAT)
                 continue
-            lines.append("        %s," % mat_expr(sym, lens, is_array))
+            lines.append("        %s," % mat_expr(sym, lens, is_array, idxbits[sym], sym in pools))
         lines.append("    },")
     lines.append("};")
     lines.append("")
     for name, sym in TOP_FIELDS:
-        lines.append("const nm_mat %s = %s;" % (name, mat_expr(sym, lens, is_array)))
+        lines.append("const nm_mat %s = %s;"
+                     % (name, mat_expr(sym, lens, is_array, idxbits[sym], sym in pools)))
     lines.append("")
     OUT.write_text("\n".join(lines), encoding="utf-8", newline="\n")
 

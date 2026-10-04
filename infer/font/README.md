@@ -1,0 +1,90 @@
+# infer/font — OLED 用的 8x8 子集字库
+
+上板显示模型输出用的点阵字库。**只存子集**：完整的泛中日韩 8px 字库有 27,987 个字形，
+整机 Flash 根本放不下（账本见下），所以按语料词频选字，字库外的码点渲染成兜底方框。
+
+## 来源（都是开源点阵字库）
+
+| 项目 | 说明 |
+|---|---|
+| [TakWolf/fusion-pixel-font](https://github.com/TakWolf/fusion-pixel-font) | 8px 等宽泛中日韩点阵，OFL-1.1，3.2k star。**本字库的字形就取自这里** |
+| [ItMarki/MisekiBitmap](https://github.com/ItMarki/MisekiBitmap) | 8x8 简体汉字字形来源（fusion-pixel 的 8px 简体就是它），OFL-1.1 |
+| [dhepper/font8x8](https://github.com/dhepper/font8x8) | 纯 ASCII 8x8，公有领域；**本字库没用它**，留作对照 |
+
+字形取自 fusion-pixel-font 官方 Release 的 `fusion-pixel-font-8px-monospaced-bdf-v2026.02.27.zip`
+里的 `latin` 与 `zh_hans` 两份 BDF。BDF 是官方栅格化的结果，逐位确定，比拿 PIL 现渲染可靠。
+许可原件在 `licenses/`。
+
+## 重新生成
+
+BDF 单份 3 MB，不入库（`tmp/` 已被 .gitignore 忽略）。要重新选字就先下载解压：
+
+```powershell
+$env:HTTPS_PROXY='http://127.0.0.1:7890'
+curl.exe -sL -o tmp\f8.bdf.zip https://github.com/TakWolf/fusion-pixel-font/releases/download/2026.02.27/fusion-pixel-font-8px-monospaced-bdf-v2026.02.27.zip
+.\.venv\Scripts\python.exe -c "import zipfile; zipfile.ZipFile(r'tmp\f8.bdf.zip').extractall(r'tmp\f8bdf')"
+```
+
+然后两步（都带自检，不一致就报错退出）：
+
+```powershell
+.\.venv\Scripts\python.exe infer\font\select_subset.py   # BDF + 语料 -> subset_8x8.txt
+.\.venv\Scripts\python.exe infer\c\gen_font.py           # subset_8x8.txt -> infer/c/nm_font.c / .h
+```
+
+`select_subset.py` 需要 BDF 与语料，`gen_font.py` 只需要 `subset_8x8.txt`；
+所以干净 clone（没有 BDF 也没有语料）也能重新生成 C 字库。改容量只动 `--budget` 一个参数。
+
+## 存法
+
+- 8x8 格里，实测这批字形**第 0 行与第 7 列恒空**，所以每字只存 7 行 x 7 列 = **7 字节**
+  （行内 bit7..bit1 是第 0..6 列）。摆格后只要哪一行越界或第 7 列非空，选字脚本直接报错。
+- 码点表按升序存成「首个绝对 + 之后增量」的 LEB128 流，357 字只花 400 B。
+- 查表是顺序扫描 + 提前退出（码点升序，超过目标就停），字库外与非法 UTF-8 都返回兜底字形
+  （7x7 空心方框）。OLED 驱动拿到 `nm_emit_fn` 给的一个完整字符后调 `nm_font_lookup_utf8` 即可。
+
+## 容量账本（实测，Cortex-M3 clang -Oz）
+
+| 项 | 字节 |
+|---|---|
+| 点阵 2,499 + 码点表 400 + 兜底 7 | 2,906 |
+| 查表代码（`nm_font_lookup` / `nm_font_lookup_utf8`） | 344 |
+| .ARM.exidx | 16 |
+| **字库合计** | **3,266** |
+
+整机 Flash 62,056 -> **65,322 B**，64 KiB 余 **214 B**；RAM 不变（字库全在 Flash）。
+
+## 为什么只有 357 字
+
+语料 bot 侧共 701 个不同字符。实测（`infer/font/select_subset.py --budget` 控制）：
+
+| 方案 | 点阵+码点表 | 语料字符覆盖 | 整条回复可完整渲染 |
+|---|---|---|---|
+| 频率前 357 字（当前，budget 2,900） | 2,899 B | 89.98% | 25.12% |
+| 频率前 497 字 | 3,976 B | 94.80% | 56.80% |
+| 全部 701 字 | 5,623 B | 100% | 100% |
+
+模型真实输出侧：30 条演示/泛化问答共 542 个字符，当前字库有 **5.54%**（29 种）渲染不出来 ——
+其中一部分是模型跑飞时吐的语料外字符（`✉䜈丆兌坸` 这种），**全量字库也照样覆盖不到**，
+所以兜底字形无论如何都要有。
+
+整机只有 3,480 B 余量（权重 42,912 + scale 表 6,516 + .text 9,600 已经吃掉 62 KB），
+全量 8x8 字库还差约 2.3 KB。要全量，先得从下面这些里挤：
+
+| 可挤的 | 字节 | 代价 |
+|---|---|---|
+| `.ARM.exidx` | 496 | 链接后 objcopy 删段（clang ARM 后端无条件发 `.fnstart`，编译开关去不掉） |
+| 描述符表 `nm_mat` 等 | ~1,760 | 绝对指针改成 uint16 偏移 |
+| LUT（exp / log1p） | 1,028 | 换 CMSIS-DSP 那种无表整数算法，会动 G1 逐位口径 |
+| `.text` | 9,600 | 其中 `nm_forward_token` 一个占 3,940 |
+
+另一条路是把语料字符集收窄（语料是自己合成的），这样字库能 100% 覆盖，不用挤 Flash。
+
+## 测试
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest infer\tests\test_font.py -q
+```
+
+- 生成的 C 字库 == `subset_8x8.txt` == BDF 原件，逐位一致（BDF 不在时那条 skip）。
+- `infer/c/nm_font_selftest.c`：码点表严格升序、每个码点查回自己的点阵、字库外与非法 UTF-8 给兜底。

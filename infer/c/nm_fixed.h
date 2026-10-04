@@ -167,22 +167,23 @@ static inline int64_t nm_shl_checked(int64_t prod, int shift)
  *           再看余数最高位（half）与其余低位（rest）决定是否进位 —— 正好是取偶语义。 */
 static inline uint64_t nm_u128_shr_round(uint64_t hi, uint64_t lo, int k)
 {
-    uint64_t q, half, rest_nonzero;
+    uint64_t q, half, rest_nonzero, s;
     if (k >= 128) return 0;
     if (k > 64) {
         int sh = k - 64;                       /* 1..63 */
+        s = hi << (64 - sh);                   /* hi 的低 sh 位搬到最高端，供下面两行共用 */
         q = hi >> sh;
-        half = (hi >> (sh - 1)) & 1;
-        rest_nonzero = (sh == 1) ? (lo != 0)
-                                 : (((hi & (((uint64_t)1 << (sh - 1)) - 1)) != 0) || (lo != 0));
+        half = s >> 63;
+        rest_nonzero = ((s << 1) != 0) || (lo != 0);
     } else if (k == 64) {
         q = hi;
         half = (lo >> 63) & 1;
         rest_nonzero = (lo << 1) != 0;
     } else {
+        s = lo << (64 - k);                    /* lo 的低 k 位搬到最高端，供下面两行共用 */
         q = (hi << (64 - k)) | (lo >> k);
-        half = (lo >> (k - 1)) & 1;
-        rest_nonzero = (k == 1) ? 0 : ((lo & (((uint64_t)1 << (k - 1)) - 1)) != 0);
+        half = s >> 63;
+        rest_nonzero = (s << 1) != 0;
     }
     if (half && (rest_nonzero || (q & 1))) q++;
     return q;
@@ -309,14 +310,30 @@ static inline int64_t nm_requant_code_u128(int64_t v, nm_u128 num)
         nm_mul_wide(av, (uint64_t)NM_QUANT_DEN, &p_hi, &p_lo);
     }
 
+    /* 32 位硬件除法快路：num 与 |v| * 16256 都装得进 32 位时，Cortex-M3 的 udiv
+     * 一条指令就给出商与余数（探针实测 66% 的调用走这里），比下面的 8 轮长除法
+     * 便宜近 20 倍。语义逐位一致 —— 商 |q| <= 128 只占 8 位，长除法本来也只是把
+     * 高 8 位试减出来。取偶判据 2*rem ? d 写成 rem ? d - rem，免得 rem << 1 溢出。 */
+    if (num.hi == 0 && p_hi == 0 &&
+        num.lo <= (uint64_t)UINT32_MAX && p_lo <= (uint64_t)UINT32_MAX) {
+        uint32_t dd = (uint32_t)num.lo, nn = (uint32_t)p_lo;
+        uint32_t q32 = nn / dd, rem32 = nn - q32 * dd, half32 = dd - rem32;
+        if (rem32 > half32 || (rem32 == half32 && (q32 & 1u))) q32++;
+        return neg ? -(int64_t)q32 : (int64_t)q32;
+    }
+
     /* 值域落在 64 位内的快速路径（本模型的 Q16 激活量化点全部走这里）：
      * 同样的 8 位长除法，但每轮只动 64 位，宽运算量减半。条件里的移位前提是
      * num * 128 不溢出 64 位；不满足时自动落到下面的 128 位通用分支。 */
     if (num.hi == 0 && p_hi == 0 && num.lo <= (UINT64_MAX >> 7)) {
-        uint64_t d = num.lo, rem = p_lo, t = d << 7;
+        /* 商正好 8 位：用「位掩码每轮右移」代替 1 << k。Cortex-M3 没有 64 位变长移位
+         * 指令，写成 1 << k 时 clang 会在循环体里插一次 bl __aeabi_llsl —— 实测每次
+         * 取码最多调 8 次，是上板热路径里最大的隐藏开销。语义逐位不变。 */
+        uint64_t d = num.lo, rem = p_lo, t = d << 7, bit = (uint64_t)1 << 7;
         for (k = 7; k >= 0; k--) {
-            if (rem >= t) { rem -= t; q |= (uint64_t)1 << k; }
+            if (rem >= t) { rem -= t; q |= bit; }
             t >>= 1;
+            bit >>= 1;
         }
         cmp = (rem << 1) > d ? 1 : ((rem << 1) == d ? 0 : -1);
         if (cmp > 0 || (cmp == 0 && (q & 1))) q++;
@@ -324,18 +341,21 @@ static inline int64_t nm_requant_code_u128(int64_t v, nm_u128 num)
     }
     {
     nm_u128 p, t, two;
+    uint64_t bit = (uint64_t)1 << 7;
     p.hi = p_hi;
     p.lo = p_lo;
     /* 商 |q| ≤ 128 正好 8 位：从最高位 t = num * 128 起逐位试减（长除法），每轮 t 右移一位。
-     * 8 轮定长，取代原来最多 129 次「比较 + 减法」的计数循环。 */
+     * 8 轮定长，取代原来最多 129 次「比较 + 减法」的计数循环；置位同样走掩码右移，
+     * 免得在 Cortex-M3 上每轮插一次 __aeabi_llsl。 */
     t = nm_u128_mul_u64(num, 128u);
     for (k = 7; k >= 0; k--) {
         if (nm_u128_cmp(p, t) >= 0) {
             p = nm_u128_sub(p, t);
-            q |= (uint64_t)1 << k;
+            q |= bit;
         }
         t.lo = (t.lo >> 1) | (t.hi << 63);
         t.hi >>= 1;
+        bit >>= 1;
     }
     two.hi = (p.hi << 1) | (p.lo >> 63);          /* 2 * 余数；余数 < num < 2^67 → 不溢出 */
     two.lo = p.lo << 1;
