@@ -60,6 +60,18 @@ def assert_close_codes(got, want, min_exact=0.98):
     assert exact >= min_exact, exact
 
 
+def assert_close_codes_many(pairs, min_exact=0.98):
+    """输入：(got, want) 码对列表；预期行为：整体逐位差 <= 1，总命中率不低于 min_exact。
+
+    单组 128 个样本的命中率自身就有约 0.6% 的抽样抖动（真实命中率 ~99.5%），
+    逐组卡 0.98 等于掷骰子；把 20 组（2560 个样本）合起来统计，阈值才有统计意义。
+    """
+    diffs = [abs(a - b) for got, want in pairs for a, b in zip(got, want)]
+    assert max(diffs) <= 1
+    exact = sum(1 for d in diffs if d == 0) / len(diffs)
+    assert exact >= min_exact, exact
+
+
 def test_rescale_round_trip():
     """rescale 落到 Q(FRAC_BITS) 再乘回来，误差必须在一个量子以内。"""
     for scale in (0.5, 1.0 / 127, 3.7e-3, 2.0 ** -20, 1.0):
@@ -147,7 +159,12 @@ def test_log1p_q_matches_math():
 
 
 def _qat_pairs(kind, ref_fn, count=128, spread=3.0, trials=20):
-    """输入：非线性名、torch 参考函数；输出：逐组 (QTensor 输入, QAT 输出码, QAT scale)。"""
+    """输入：非线性名、torch 参考函数；输出：逐组 (QTensor 输入, QAT 输出码, QAT scale)。
+
+    预期行为：抽样用 kind 派生的固定种子，同一测试每次跑到的样本完全一样。
+              不设种子时 20 组里偶尔会抽到一组让命中率掉到阈值以下，测试就变成掷骰子。
+    """
+    torch.manual_seed(20261004 + sum(kind.encode("utf-8")))
     for _ in range(trials):
         fq = IntxFakeQuantizer(per_tensor_int8())
         z = torch.randn(count) * spread
@@ -159,31 +176,38 @@ def _qat_pairs(kind, ref_fn, count=128, spread=3.0, trials=20):
 
 def test_qt_sigmoid_matches_qat():
     """qt_sigmoid 必须复现训练侧 fq_act(sigmoid(x)) 的 int8 码与 scale。"""
+    pairs = []
     for qt_in, want, s_ref in _qat_pairs("sigmoid", torch.sigmoid):
         out = qt_sigmoid(qt_in)
-        assert_close_codes(out.codes, want)
         assert abs(value(out.scale) / s_ref - 1) < 1e-3
+        pairs.append((out.codes, want))
+    assert_close_codes_many(pairs)
 
 
 def test_qt_tanh_matches_qat():
     """qt_tanh 必须复现训练侧 fq_act(tanh(x)) 的 int8 码与 scale。"""
+    pairs = []
     for qt_in, want, s_ref in _qat_pairs("tanh", torch.tanh):
         out = qt_tanh(qt_in)
-        assert_close_codes(out.codes, want)
         assert abs(value(out.scale) / s_ref - 1) < 1e-3
+        pairs.append((out.codes, want))
+    assert_close_codes_many(pairs)
 
 
 def test_qt_softplus_matches_qat():
     """qt_softplus 必须复现训练侧 fq_act(softplus(x)) 的 int8 码与 scale。"""
+    pairs = []
     for qt_in, want, s_ref in _qat_pairs("softplus", F.softplus, spread=2.0):
         out = qt_softplus(qt_in)
-        assert_close_codes(out.codes, want)
         assert abs(value(out.scale) / s_ref - 1) < 1e-3
+        pairs.append((out.codes, want))
+    assert_close_codes_many(pairs)
 
 
 def test_qt_exp_matches_qat():
     """qt_exp 必须复现训练侧 fq_act(exp(x)) 的 int8 码（输入限定非正）。"""
     torch.manual_seed(1)
+    pairs = []
     for _ in range(20):
         fq = IntxFakeQuantizer(per_tensor_int8())
         z = -torch.rand(128) * 3.0
@@ -191,8 +215,9 @@ def test_qt_exp_matches_qat():
         s_in = float(fq.scale)
         ref = fq(torch.exp(zq))
         out = qt_exp(qt_of(zq, s_in))
-        assert_close_codes(out.codes, codes_of(ref, float(fq.scale)))
         assert abs(value(out.scale) / float(fq.scale) - 1) < 1e-3
+        pairs.append((out.codes, codes_of(ref, float(fq.scale))))
+    assert_close_codes_many(pairs)
 
 
 def test_qt_ops_all_zero_input():

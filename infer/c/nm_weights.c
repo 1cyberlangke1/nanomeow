@@ -1,7 +1,7 @@
 /* 自动生成，请勿手改：infer/c/gen_weights.py
  *
  * 权重来源：infer/model_weights.h（train/scripts/export_int8.py 从 checkpoint 导出）
- * 模型：3 层 RWKV-7 x070 缩维，n_embd=32，n_head=4，head_size=8，dim_ffn=64，词表 256
+ * 模型：3 层 RWKV-7 x070 缩维，n_embd=32，n_head=4，head_size=8，dim_ffn=32，词表 256
  *
  * 导出的权重（名字 = 训练侧参数名；字节数 = int8 码 / scale 表）：
  *   emb.weight                         8192 B /  1280 B  (per-row 256 x 32)
@@ -38,8 +38,8 @@
  *   blocks.0.att.ln_x.weight             32 B /     5 B  (per-tensor 32)
  *   blocks.0.att.ln_x.bias               32 B /     5 B  (per-tensor 32)
  *   blocks.0.ffn.x_k                     32 B /     5 B  (per-tensor 32)
- *   blocks.0.ffn.key.weight            2048 B /   320 B  (per-row 64 x 32)
- *   blocks.0.ffn.value.weight          2048 B /   160 B  (per-row 32 x 64)
+ *   blocks.0.ffn.key.weight            1024 B /   160 B  (per-row 32 x 32)
+ *   blocks.0.ffn.value.weight          1024 B /   160 B  (per-row 32 x 32)
  *   blocks.1.ln1.weight                  32 B /     5 B  (per-tensor 32)
  *   blocks.1.ln1.bias                    32 B /     5 B  (per-tensor 32)
  *   blocks.1.ln2.weight                  32 B /     5 B  (per-tensor 32)
@@ -71,8 +71,8 @@
  *   blocks.1.att.ln_x.weight             32 B /     5 B  (per-tensor 32)
  *   blocks.1.att.ln_x.bias               32 B /     5 B  (per-tensor 32)
  *   blocks.1.ffn.x_k                     32 B /     5 B  (per-tensor 32)
- *   blocks.1.ffn.key.weight            2048 B /   320 B  (per-row 64 x 32)
- *   blocks.1.ffn.value.weight          2048 B /   160 B  (per-row 32 x 64)
+ *   blocks.1.ffn.key.weight            1024 B /   160 B  (per-row 32 x 32)
+ *   blocks.1.ffn.value.weight          1024 B /   160 B  (per-row 32 x 32)
  *   blocks.2.ln1.weight                  32 B /     5 B  (per-tensor 32)
  *   blocks.2.ln1.bias                    32 B /     5 B  (per-tensor 32)
  *   blocks.2.ln2.weight                  32 B /     5 B  (per-tensor 32)
@@ -104,17 +104,17 @@
  *   blocks.2.att.ln_x.weight             32 B /     5 B  (per-tensor 32)
  *   blocks.2.att.ln_x.bias               32 B /     5 B  (per-tensor 32)
  *   blocks.2.ffn.x_k                     32 B /     5 B  (per-tensor 32)
- *   blocks.2.ffn.key.weight            2048 B /   320 B  (per-row 64 x 32)
- *   blocks.2.ffn.value.weight          2048 B /   160 B  (per-row 32 x 64)
+ *   blocks.2.ffn.key.weight            1024 B /   160 B  (per-row 32 x 32)
+ *   blocks.2.ffn.value.weight          1024 B /   160 B  (per-row 32 x 32)
  *   ln_out.weight                        32 B /     5 B  (per-tensor 32)
  *   ln_out.bias                          32 B /     5 B  (per-tensor 32)
  *   head.weight                        8192 B /  1280 B  (per-row 256 x 32)
  *
- * 权重合计：码 49056 B（47.9 KiB）+ scale 表 8625 B（8.4 KiB）= 57681 B（56.3 KiB）
- * 内存占用（Flash 常驻只读表）：57681 B（56.3 KiB）
+ * 权重合计：码 42912 B（41.9 KiB）+ scale 表 8145 B（8.0 KiB）= 51057 B（49.9 KiB）
+ * 内存占用（Flash 常驻只读表）：51057 B（49.9 KiB）
  * 内存占用（RAM）：状态 3 层 x 1124 B = 3372 B（3.3 KiB，含每层 int32 wkv 1024 B）
- *                  + 引擎工作区 24 个 int64[64] 暂存 + Q15 衰减表 = 14656 B（14.3 KiB）
- *                  = 18028 B（17.6 KiB），不含调用栈
+ *                  + 引擎工作区 24 个 int64[32] 暂存 + Q15 衰减表 = 8512 B（8.3 KiB）
+ *                  = 11884 B（11.6 KiB），不含调用栈
  */
 
 #include "../model_weights.h"
@@ -155,8 +155,8 @@ const nm_block nm_blocks[NM_N_LAYER] = {
         {nmw_blocks_0_att_ln_x_weight, &nmw_blocks_0_att_ln_x_weight_mul, &nmw_blocks_0_att_ln_x_weight_shift, 1, 32, 0},
         {nmw_blocks_0_att_ln_x_bias, &nmw_blocks_0_att_ln_x_bias_mul, &nmw_blocks_0_att_ln_x_bias_shift, 1, 32, 0},
         {nmw_blocks_0_ffn_x_k, &nmw_blocks_0_ffn_x_k_mul, &nmw_blocks_0_ffn_x_k_shift, 1, 32, 0},
-        {nmw_blocks_0_ffn_key_weight, nmw_blocks_0_ffn_key_weight_mul, nmw_blocks_0_ffn_key_weight_shift, 64, 32, 1},
-        {nmw_blocks_0_ffn_value_weight, nmw_blocks_0_ffn_value_weight_mul, nmw_blocks_0_ffn_value_weight_shift, 32, 64, 1},
+        {nmw_blocks_0_ffn_key_weight, nmw_blocks_0_ffn_key_weight_mul, nmw_blocks_0_ffn_key_weight_shift, 32, 32, 1},
+        {nmw_blocks_0_ffn_value_weight, nmw_blocks_0_ffn_value_weight_mul, nmw_blocks_0_ffn_value_weight_shift, 32, 32, 1},
     },
     { /* layer 1 */
         {NULL, NULL, NULL, 0, 0, 0},
@@ -192,8 +192,8 @@ const nm_block nm_blocks[NM_N_LAYER] = {
         {nmw_blocks_1_att_ln_x_weight, &nmw_blocks_1_att_ln_x_weight_mul, &nmw_blocks_1_att_ln_x_weight_shift, 1, 32, 0},
         {nmw_blocks_1_att_ln_x_bias, &nmw_blocks_1_att_ln_x_bias_mul, &nmw_blocks_1_att_ln_x_bias_shift, 1, 32, 0},
         {nmw_blocks_1_ffn_x_k, &nmw_blocks_1_ffn_x_k_mul, &nmw_blocks_1_ffn_x_k_shift, 1, 32, 0},
-        {nmw_blocks_1_ffn_key_weight, nmw_blocks_1_ffn_key_weight_mul, nmw_blocks_1_ffn_key_weight_shift, 64, 32, 1},
-        {nmw_blocks_1_ffn_value_weight, nmw_blocks_1_ffn_value_weight_mul, nmw_blocks_1_ffn_value_weight_shift, 32, 64, 1},
+        {nmw_blocks_1_ffn_key_weight, nmw_blocks_1_ffn_key_weight_mul, nmw_blocks_1_ffn_key_weight_shift, 32, 32, 1},
+        {nmw_blocks_1_ffn_value_weight, nmw_blocks_1_ffn_value_weight_mul, nmw_blocks_1_ffn_value_weight_shift, 32, 32, 1},
     },
     { /* layer 2 */
         {NULL, NULL, NULL, 0, 0, 0},
@@ -229,8 +229,8 @@ const nm_block nm_blocks[NM_N_LAYER] = {
         {nmw_blocks_2_att_ln_x_weight, &nmw_blocks_2_att_ln_x_weight_mul, &nmw_blocks_2_att_ln_x_weight_shift, 1, 32, 0},
         {nmw_blocks_2_att_ln_x_bias, &nmw_blocks_2_att_ln_x_bias_mul, &nmw_blocks_2_att_ln_x_bias_shift, 1, 32, 0},
         {nmw_blocks_2_ffn_x_k, &nmw_blocks_2_ffn_x_k_mul, &nmw_blocks_2_ffn_x_k_shift, 1, 32, 0},
-        {nmw_blocks_2_ffn_key_weight, nmw_blocks_2_ffn_key_weight_mul, nmw_blocks_2_ffn_key_weight_shift, 64, 32, 1},
-        {nmw_blocks_2_ffn_value_weight, nmw_blocks_2_ffn_value_weight_mul, nmw_blocks_2_ffn_value_weight_shift, 32, 64, 1},
+        {nmw_blocks_2_ffn_key_weight, nmw_blocks_2_ffn_key_weight_mul, nmw_blocks_2_ffn_key_weight_shift, 32, 32, 1},
+        {nmw_blocks_2_ffn_value_weight, nmw_blocks_2_ffn_value_weight_mul, nmw_blocks_2_ffn_value_weight_shift, 32, 32, 1},
     },
 };
 

@@ -12,13 +12,17 @@
 
 #include "nm_fixed.h"
 
-#define NM_N_LAYER 3
-#define NM_N_EMBD 32
-#define NM_N_HEAD 4
-#define NM_HEAD_SIZE 8
-#define NM_DIM_FFN 64
-#define NM_VOCAB 256
-#define NM_CTX_LEN 512
+/* 结构常量只有一处真相：由 train/scripts/export_int8.py 按 checkpoint 生成到
+ * infer/model_cfg.h。引擎跟着权重头走，改维度不必手改本文件。 */
+#include "../model_cfg.h"
+
+#define NM_N_LAYER NMW_N_LAYER
+#define NM_N_EMBD NMW_N_EMBD
+#define NM_N_HEAD NMW_N_HEAD
+#define NM_HEAD_SIZE NMW_HEAD_SIZE
+#define NM_DIM_FFN NMW_DIM_FFN
+#define NM_VOCAB NMW_VOCAB
+#define NM_CTX_LEN NMW_CTX_LEN
 
 /* 一层张量：per-row 权重给 rows 行 scale，per-tensor 常量给 1 个。 */
 typedef struct {

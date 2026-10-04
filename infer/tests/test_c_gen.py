@@ -27,7 +27,7 @@ from src.generate import build_prompt  # noqa: E402
 from src.tokenizer import ETX_ID, UTF8StreamDecoder, encode  # noqa: E402
 
 C_DIR = HERE.parents[1] / "c"
-CKPT = REPO / "train" / "out" / "sft_para8" / "sft.pth"
+CKPT = REPO / "train" / "out" / "sft_v2" / "sft.pth"
 GCC = shutil.which("gcc")
 Q16 = 65536
 PEN_13 = 85197          # round(1.3 * 2^16)，与 Python 侧用同一个整数

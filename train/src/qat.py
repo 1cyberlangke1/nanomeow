@@ -79,6 +79,18 @@ class PerRow(Granularity):
     dim: int = -1
 
 
+@dataclass(frozen=True)
+class PerPosition(Granularity):
+    """前 keep 维（batch / time）每个位置一组 qparam，其余维归约。
+
+    为什么需要它：推理时一次只喂一个位置（T=1），那时 per-tensor 就等于「这一位置的
+    整条通道向量」；训练时喂的是 (B,T,...)，同一个 per-tensor 会把 scale 摊到整个
+    batch 上，量化网格比部署侧粗得多。按位置分组，两边的 scale 才逐位对齐。
+    """
+
+    keep: int = 2
+
+
 def get_block_size(input_shape: Tuple[int, ...], granularity: Granularity) -> Tuple[int, ...]:
     """移植自 torchao/quantization/utils.py::get_block_size。
 
@@ -88,6 +100,13 @@ def get_block_size(input_shape: Tuple[int, ...], granularity: Granularity) -> Tu
     """
     if isinstance(granularity, PerTensor):
         return input_shape
+    elif isinstance(granularity, PerPosition):
+        # 前 keep 维是 (batch, time)：3D/4D 激活直接按位置分组；2D 激活（例如
+        # group_norm 之后的 (B*T, C)）已经摊平了 batch 和 time，第 0 维就是位置，
+        # 所以 keep 要收到 ndim-1 —— 但**最后一维（特征）永远要归约**，
+        # 否则一个位置一个元素一个 scale，等于没量化。
+        keep = min(granularity.keep, len(input_shape) - 1)
+        return tuple([1] * keep + list(input_shape[keep:]))
     elif isinstance(granularity, PerAxis):
         block_size = list(input_shape)
         block_size[granularity.axis] = 1
@@ -545,6 +564,26 @@ def per_row_int8() -> IntxFakeQuantizeConfig:
     )
 
 
+def per_position_int8() -> IntxFakeQuantizeConfig:
+    """输入：无；输出：激活的口径——int8、按 (batch,time) 位置分组、对称、动态。
+
+    预期行为：与推理侧一致。部署时每个位置单独走一遍量化（`infer/ref/int8_model.py`
+    的 `_quantize_rows` 在 T=1 时就是「一个位置一条向量一个 scale」），训练侧必须用
+    同一个网格；否则模型是照着比部署更粗的噪声在学，训练 loss 和部署表现对不上。
+    """
+    return IntxFakeQuantizeConfig(
+        dtype=torch.int8,
+        granularity=PerPosition(2),
+        mapping_type=MappingType.SYMMETRIC_NO_CLIPPING_ERR,
+        scale_precision=torch.float32,
+        zero_point_precision=torch.int32,
+        zero_point_domain=ZeroPointDomain.NONE,
+        is_dynamic=True,
+        quant_min=INT8_MIN,
+        quant_max=INT8_MAX,
+    )
+
+
 class FakeQuantizerBase(torch.nn.Module):
     """移植自 torchao.quantization.qat.fake_quantizer.FakeQuantizerBase。"""
 
@@ -580,14 +619,19 @@ class IntxFakeQuantizer(FakeQuantizerBase):
         """输入：float 张量；输出：假量化后的张量。"""
         if not self.enabled:
             return x
-        if isinstance(self.config.granularity, PerTensor):
+        if isinstance(self.config.granularity, (PerTensor, PerPosition)):
             return self._per_tensor_forward(x)
         elif isinstance(self.config.granularity, (PerAxis, PerRow)):
             return self._per_channel_or_group_forward(x)
         raise ValueError("Unknown granularity '%s'" % self.config.granularity)
 
     def _per_tensor_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """输入：float 张量；输出：per-tensor 假量化结果。"""
+        """输入：float 张量；输出：按 block_size 归约的假量化结果。
+
+        预期行为：PerTensor 的 block_size 是整个形状（全张量一组 qparam），
+                  PerPosition 的 block_size 是 (1,1,...)（每个位置一组），
+                  两者都走同一条通用仿射路径，只是归约维不同。
+        """
         qmin, qmax = self.config.quant_min, self.config.quant_max
         block_size = get_block_size(x.shape, self.config.granularity)
         if self._should_compute_qparams():
@@ -859,12 +903,18 @@ def disable_embedding_fake_quant(mod: torch.nn.Module) -> None:
 def prepare_qat(model: torch.nn.Module) -> torch.nn.Module:
     """输入：NanoRWKV；输出：同一个模型对象（已原地替换成 QAT 版）。
 
-    预期行为：所有 nn.Linear -> FakeQuantizedLinear（权重 per-row、激活 per-tensor）、
+    预期行为：所有 nn.Linear -> FakeQuantizedLinear（权重 per-row、激活逐位置）、
               nn.Embedding -> FakeQuantizedEmbedding（权重 per-row）、模型自带的
               IntxFakeQuantizer（逐元素参数与中间激活的插桩点）全部 enabled=True。
               权重张量原地搬过去，state_dict 的键名与初始化结果都不变。
+
+    激活为什么必须逐位置：模型里每个 nn.Linear 的输入都已经在上一个 fq_act 点被逐位置
+    量化过，而部署侧的 GEMV 直接用输入自带的码与 scale、**不再单独量化输入**
+    （见 infer/ref/int8_model.py::linear 的注释）。逐位置再量化对已量化的张量是幂等的，
+    两边才等价；用 per-tensor 的话，整批共用一个 scale 会把这个已经量化好的输入重新摊粗，
+    等于训练时多插了一层部署侧根本不存在的噪声。
     """
-    act_cfg, w_cfg = per_tensor_int8(), per_row_int8()
+    act_cfg, w_cfg = per_position_int8(), per_row_int8()
     for module in model.modules():
         for child_name, child in list(module.named_children()):
             if type(child) is torch.nn.Linear:

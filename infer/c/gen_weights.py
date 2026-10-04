@@ -19,6 +19,7 @@ HEADER = HERE.parent / "model_weights.h"
 ENGINE_H = HERE / "nanomeow.h"
 ENGINE_C = HERE / "nanomeow.c"
 OUT = HERE / "nm_weights.c"
+CFG = HERE.parent / "model_cfg.h"    # 结构常量的唯一来源，由导出脚本按 checkpoint 生成
 N_LAYER = 3
 
 # nm_block 字段名 -> 头文件符号里 `nm_blocks_<层号>_` 之后的那一段
@@ -137,9 +138,13 @@ def mat_expr(sym, lens, is_array):
 
 
 def parse_defines(text):
-    """输入：nanomeow.h 文本；输出：{宏名: 整数}。预期行为：只认 `#define NM_X <十进制>`。"""
-    return {m.group(1): int(m.group(2))
-            for m in re.finditer(r"^#define (NM_\w+) (\d+)$", text, re.M)}
+    """输入：infer/model_cfg.h 文本；输出：{NM_X: 整数}。
+
+    预期行为：只认 `#define NMW_X <十进制>`，返回时把 NMW_ 前缀换成 NM_。结构常量由
+              train/scripts/export_int8.py 按 checkpoint 生成，这里跟着它走，不再抄一份。
+    """
+    return {"NM_" + m.group(1): int(m.group(2))
+            for m in re.finditer(r"^#define NMW_(\w+) (\d+)$", text, re.M)}
 
 
 def state_bytes(d):
@@ -178,7 +183,7 @@ def workspace_bytes(engine, d):
 def main():
     """输入：无；输出：写 nm_weights.c 并在 stdout 打印一行摘要。"""
     lens, is_array, order = parse_header(HEADER.read_text(encoding="utf-8"))
-    d = parse_defines(ENGINE_H.read_text(encoding="utf-8"))
+    d = parse_defines(CFG.read_text(encoding="utf-8"))
     work_bytes, work_n = workspace_bytes(ENGINE_C.read_text(encoding="utf-8"), d)
 
     tensors = [s for s in order if is_tensor(s, lens)]

@@ -5,7 +5,8 @@ import torch
 from src.config import NanoConfig
 from src.model import DEAD_BY_REFERENCE_BRANCH, NanoRWKV
 from src.qat import (FakeQuantizedEmbedding, FakeQuantizedLinear, IntxFakeQuantizer,
-                     disable_qat, per_row_int8, per_tensor_int8, prepare_qat)
+                     PerPosition, disable_qat, per_position_int8, per_row_int8,
+                     per_tensor_int8, prepare_qat)
 
 TINY = NanoConfig()
 
@@ -223,3 +224,66 @@ def test_compile_preserves_fake_quant():
 
     assert torch.allclose(compiled, eager_q, atol=1e-5, rtol=1e-4), "编译后与 eager 的 QAT 输出不一致"
     assert not torch.allclose(compiled, eager_plain, atol=1e-3), "编译后等于关量化的结果，量化点被折叠了"
+
+
+def _spread_activations(B=2, T=5, C=8, seed=7):
+    """输入：形状与种子；输出：每个位置量级差 6 倍的 (B,T,C) 激活。
+
+    预期行为：位置之间量级拉开，才能看出「整批一个 scale」和「每位置一个 scale」的差别。
+    """
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(B, T, C, generator=g)
+    return x * torch.linspace(0.05, 3.0, T).view(1, T, 1)
+
+
+def test_activation_quant_matches_single_position_deployment():
+    """激活插桩点必须与推理侧同口径：整批前向里第 t 个位置的量化结果，
+    等于把该位置单独喂进去（T=1）时的结果。
+
+    预期行为：部署一次只喂一个位置，per-tensor 在那里就是「一条向量一个 scale」；
+              训练侧按位置分组才与它等价，否则 scale 被整个 batch 摊粗。
+    """
+    x = _spread_activations()
+    q_batch = IntxFakeQuantizer(per_position_int8())(x)
+    for b in range(x.shape[0]):
+        for t in range(x.shape[1]):
+            q_single = IntxFakeQuantizer(per_tensor_int8())(x[b, t])
+            assert torch.equal(q_batch[b, t], q_single), (b, t)
+
+
+def test_batch_wide_activation_quant_is_coarser_than_deployment():
+    """对照：整批共用一个 scale（改之前的口径）会把小量级位置摊粗，与部署侧不一致。
+
+    预期行为：这条是「为什么必须改」的证据，不是实现细节 —— 它一挂说明这个 bug 回来了。
+    """
+    x = _spread_activations()
+    q_batch = IntxFakeQuantizer(per_tensor_int8())(x)
+    q_pos = IntxFakeQuantizer(per_position_int8())(x)
+    flat = int(x.abs().mean(dim=-1).argmin())
+    tiny = (flat // x.shape[1], flat % x.shape[1])
+    assert not torch.equal(q_batch[tiny], q_pos[tiny])
+    assert torch.equal(q_pos[tiny], IntxFakeQuantizer(per_tensor_int8())(x[tiny]))
+
+
+def test_prepare_qat_linear_activation_matches_deployment():
+    """nn.Linear 的激活量化必须与 fq_act 同口径（逐位置）。
+
+    预期行为：部署侧 GEMV 直接用输入自带的码与 scale、不再量化输入，
+              所以训练侧这里也只能是逐位置；一挂说明口径又跑回 per-tensor 了。
+    """
+    model = NanoRWKV(TINY)
+    prepare_qat(model)
+    lin = model.blocks[0].att.receptance
+    assert isinstance(lin.activation_fake_quantizer.config.granularity, PerPosition)
+
+
+def test_requantizing_a_quantized_activation_is_idempotent_only_per_position():
+    """输入：已经逐位置量化过的激活；输出：再量化一次的结果。
+
+    预期行为：逐位置再量化必须逐位不变（部署侧不做这一步，训练侧做了也不能改值）；
+              对照的 per-tensor 再量化必须改值，否则这条护栏没有鉴别力。
+    """
+    x = _spread_activations()
+    q = IntxFakeQuantizer(per_position_int8())(x)
+    assert torch.equal(IntxFakeQuantizer(per_position_int8())(q), q)
+    assert not torch.equal(IntxFakeQuantizer(per_tensor_int8())(q), q)

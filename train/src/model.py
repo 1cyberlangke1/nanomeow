@@ -27,7 +27,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from .config import NanoConfig
-from .qat import IntxFakeQuantizer, per_row_int8, per_tensor_int8
+from .qat import (IntxFakeQuantizer, per_position_int8, per_row_int8,
+                  per_tensor_int8)
 from .wkv7 import run_wkv7
 
 # 参考的 value residual 是**按层分支**——第 0 层只记录 `v_first`、不做插值
@@ -40,10 +41,28 @@ DEAD_BY_REFERENCE_BRANCH = frozenset(
 
 
 def _fq() -> IntxFakeQuantizer:
-    """输入：无；输出：关闭状态的 per-tensor int8 假量化器（激活 / 逐元素常量插桩点）。
+    """输入：无；输出：关闭状态的 per-position int8 假量化器（激活插桩点）。
 
     预期行为：构造出来是 disabled 的，所以不开 QAT 时前向与参考逐位一致；
               `prepare_qat()` 会把全模型（含这里）的量化器一起打开。
+
+              粒度按 (batch,time) 位置分组，对齐推理侧：部署一次只喂一个位置，
+              per-tensor 就等于「这一位置一条向量一个 scale」。用整 batch 一个 scale
+              会让训练网格比部署粗得多，模型是照着更粗的噪声在学。
+    """
+    return IntxFakeQuantizer(per_position_int8(), enabled=False)
+
+
+def _fq_tensor() -> IntxFakeQuantizer:
+    """输入：无；输出：关闭状态的 per-tensor int8 假量化器（常量 / wkv 本体插桩点）。
+
+    预期行为：两类都必须是整张量一个 scale：
+              - x_r…x_g / w0 / a0 / v0 / k_k / k_a / r_k / ln 的 weight+bias 与位置
+                无关，部署侧导出时就是一条 per-tensor scale；换成逐位置会把每个元素
+                单独量化，等于不量化。
+              - wkv 本体的 q/k/v/a/b：它的 scale 要当 int32 state 的量化步长用，
+                而 CUDA kernel 的 `state_step` 是 0 维标量，喂不进逐位置的步长，
+                所以这里保持 per-tensor（与 kernel 同口径）。
     """
     return IntxFakeQuantizer(per_tensor_int8(), enabled=False)
 
@@ -206,9 +225,9 @@ class RWKV_Tmix_x070(nn.Module):
         #   fq_w     —— 裸权重矩阵 w1/w2、a1/a2、v1/v2、g1/g2（per-row）
         #   fq_wkv   —— wkv7 递推本体（q/k/v/a/b 与 int32 state）
         self.fq_act = _fq()
-        self.fq_param = _fq()
+        self.fq_param = _fq_tensor()
         self.fq_w = _fq_w()
-        self.fq_wkv = _fq()
+        self.fq_wkv = _fq_tensor()
 
     def matmul_w(self, x, p):
         """输入：激活 x (..., K)、裸权重 p (K, N)；输出：假量化后的 x @ p。
@@ -309,7 +328,7 @@ class RWKV_CMix_x070(nn.Module):
         self.value.weight.data.zero_()
 
         self.fq_act = _fq()
-        self.fq_param = _fq()
+        self.fq_param = _fq_tensor()
         del ddd
 
     def forward(self, x, ffn_prev=None):
@@ -341,7 +360,7 @@ class Block(nn.Module):
         self.ffn = RWKV_CMix_x070(cfg, layer_id)
 
         self.fq_act = _fq()
-        self.fq_param = _fq()
+        self.fq_param = _fq_tensor()
 
     def _norm(self, ln, x):
         """输入：LayerNorm 模块、x；输出：定点化的 LayerNorm 结果。
@@ -427,7 +446,7 @@ class NanoRWKV(nn.Module):
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
 
         self.fq_act = _fq()
-        self.fq_param = _fq()
+        self.fq_param = _fq_tensor()
         self.apply_init()
 
     @torch.no_grad()

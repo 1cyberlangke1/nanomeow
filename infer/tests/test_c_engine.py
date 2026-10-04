@@ -22,7 +22,7 @@ from ref.model import Int8Model  # noqa: E402
 from ref.weights import load_weights  # noqa: E402
 
 C_DIR = HERE.parents[1] / "c"
-CKPT = REPO / "train" / "out" / "sft_para8" / "sft.pth"
+CKPT = REPO / "train" / "out" / "sft_v2" / "sft.pth"
 DATASET = REPO / "train" / "dataset" / "nana_clean.jsonl"
 GCC = shutil.which("gcc")
 # 一段真实的对话字节（user:你好\nbot: 的开头），覆盖多字节 UTF-8 与 ASCII
