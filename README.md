@@ -8,6 +8,14 @@
 
 ---
 
+## 实机演示
+
+![STM32F103C8T6 实机对话演示](assets/oled_demo.gif)
+
+串口输入 `你好`，模型在 128x64 OLED 上逐字输出回复，画面末尾是实测吞吐读数（`tps: 1.7`）。
+
+---
+
 ## 模型与系统规格
 
 | 维度 | 参数 / 规格 | 说明 |
@@ -70,6 +78,7 @@ nanomeow/
 │  ├─ font/               8x8 点阵字模源文件、词频选字与打包脚本
 │  └─ tests/              对拍自动化测试（G1 逻辑等价性与 G2 困惑度退化闸门）
 ├─ keil_demo/             STM32 Keil MDK-ARM 工程（Project.uvprojx）
+├─ assets/                README 实机演示素材（OLED 录屏 GIF）
 ├─ LICENSE                Apache License 2.0
 └─ NOTICE                 依赖项目与开源字形授权溯源声明
 ```
