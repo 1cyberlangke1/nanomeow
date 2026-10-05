@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """OLED 可视化模拟：让上板固件在 Cortex-M3 模拟器里真跑，把软件 I2C 的位流还原成 SSD1306 屏幕。
 
-输入：`build_firmware.py` 真交叉编译出的固件 ELF、要喂给 USART1 的一行字节。
+输入：`build_firmware.py` 真交叉编译出的固件 ELF、要喂给串口的一行字节。
 输出：128x64 屏幕的字符画（默认半块字符 ▀ ▄ █，一个字符 = 上下两个像素），外加串口回显。
 预期行为：跑的是真机指令，不是行为模型。板级外设只多打一个桩 —— 拦 GPIOB 的读写，按 I2C 时序
           （START / STOP、SCL 上升沿采样、第 9 个时钟的 ACK）把位流还原成字节，再按 SSD1306
@@ -264,10 +264,10 @@ class OledBus:
 
 
 def run_with_oled(elf_path, uart_in, scl_pin=8, sda_pin=9, max_steps=run_m3.MAX_STEPS, dwt=True):
-    """输入：ELF 路径、喂给 USART1 的字节、OLED 的 SCL / SDA 引脚号、是否打开 DWT 周期桩。
+    """输入：ELF 路径、喂给串口的字节、OLED 的 SCL / SDA 引脚号、是否打开 DWT 周期桩。
     输出：(固件吐回串口的字节, OledBus)。
 
-    预期行为：完全复用 run_m3 的模拟器（同一套 RCC / USART1 打桩、同一套停机判据），只多挂一个
+    预期行为：完全复用 run_m3 的模拟器（同一套 RCC / 串口打桩、同一套停机判据），只多挂一个
               GPIOB 钩子；屏幕内容就是固件真发出去的 I2C 字节重建出来的。引脚号默认 PB8 / PB9，
               与 keil_demo/User/config.h 一致，换线时用命令行参数覆盖，不用改本文件。
               dwt 默认开：屏上右下角那行 tps 要读到非零的 DWT_CYCCNT 才画得出来，模拟器里没有
@@ -311,7 +311,7 @@ def main():
     """输入：命令行；输出：屏幕字符画 + 串口回显。预期行为：ELF 不存在就报错提示先构建。"""
     ap = argparse.ArgumentParser(description="把上板固件的 OLED 屏幕画在终端里（真跑 Cortex-M3 模拟）")
     ap.add_argument("--elf", default=str(run_m3.ROOT / "build" / "firmware" / "nanomeow.elf"))
-    ap.add_argument("--text", default="你好", help="喂给 USART1 的一行内容（会自动补换行）")
+    ap.add_argument("--text", default="你好", help="喂给串口的一行内容（会自动补换行）")
     ap.add_argument("--scl-pin", type=int, default=8, help="OLED SCL 引脚（默认 PB8，见 keil_demo/User/config.h）")
     ap.add_argument("--sda-pin", type=int, default=9, help="OLED SDA 引脚（默认 PB9）")
     ap.add_argument("--frame", type=int, default=None, help="只打第 N 帧（序号见 --all-frames 的表头）")

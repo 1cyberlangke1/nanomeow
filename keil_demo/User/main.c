@@ -1,14 +1,15 @@
-/* nanomeow 上板入口：USART1 收一行 → 模型生成 → SSD1306 显示（同一份字节回显到串口），
+/* nanomeow 上板入口：串口收一行 → 模型生成 → SSD1306 显示（同一份字节回显到串口），
  * 每轮生成完在屏上显示这次生成的**模型速度**（tokens/s）。
  *
- * 输入：USART1（PA10，115200 8N1）收字节，'\n' 结束一行；输出：SSD1306 显示 + USART1（PA9）回显。
+ * 输入：NM_UART_PORT 选中的那路 USART 的 RX 脚（115200 8N1）收字节，'\n' 结束一行；
+ *       输出：SSD1306 显示 + 同一路 USART 的 TX 脚回显。
  * 预期行为：上电把系统时钟配到 72 MHz（HSE 8 MHz × 9）、点屏，并在屏幕正中显示一行英文
  *           「nanomeow ready」自证固件已经跑起来；然后循环
  *           「等一行输入 → 清屏 → 第一行显示输入本身 → 第二行起边生成边刷屏 → 最后显示 tps」。
  *           清屏在**收到输入之后**：这样 tps 画完会一直留在屏上等下一次输入，而不是刚画完就被擦掉。
  *           屏上不显示 user: / bot: 这类前缀，只有输入、输出、速度三样。
  *           提示词严格按训练模板拼：user:<内容>\nbot:（冒号后没有空格）。全程无浮点。
- * 接线：OLED 的 SCL / SDA 引脚与串口波特率都在 User/config.h（唯一改线的地方），
+ * 接线：走哪一路 USART、OLED 的 SCL / SDA 引脚、串口波特率都在 User/config.h（唯一改线的地方），
  *       工程通过 -DNM_BOARD_CONFIG="config.h" 把它交给 nm_board.h。
  * 说明：Keil 工程由 Start/startup_nanomeow.s 提供向量表（宏 NM_VECTORS_IN_STARTUP）；
  *       build_firmware.py 的 clang 链路没有 startup 文件，由本文件自带向量表与 Reset_Handler。
@@ -54,27 +55,58 @@ static void nm_cyc_init(void)
     NM_DWT_CTRL |= 1u;
 }
 
-/* 输入：无；输出：无。预期行为：PA9 = 复用推挽输出、PA10 = 浮空输入，USART1 开 115200 收发。 */
+/* 串口用哪一路：把 NM_UART_PORT 换算成收发两个寄存器地址。
+ * 为什么要有这层：三路 USART 只有基址不同，收发函数只认 SR / DR 两个地址。 */
+#if NM_UART_PORT == 1
+#define NM_UART_SR NM_USART1_SR
+#define NM_UART_DR NM_USART1_DR
+#elif NM_UART_PORT == 2
+#define NM_UART_SR NM_USART2_SR
+#define NM_UART_DR NM_USART2_DR
+#elif NM_UART_PORT == 3
+#define NM_UART_SR NM_USART3_SR
+#define NM_UART_DR NM_USART3_DR
+#else
+#error "NM_UART_PORT 只能是 1（USART1）/ 2（USART2）/ 3（USART3）"
+#endif
+
+/* 输入：无；输出：无。预期行为：把 NM_UART_PORT 选中的 USART 配成 115200 8N1 收发。
+ * TX 脚 = 复用推挽输出（CR 半字节 0xB）、RX 脚 = 浮空输入（0x4）；USART1 挂 APB2（PCLK2 = 72 MHz）、
+ * USART2 / USART3 挂 APB1（PCLK1 = 36 MHz），所以波特率寄存器值 NM_UART_BRR 跟着端口走。 */
 static void nm_uart_init(void)
 {
+#if NM_UART_PORT == 1
     NM_RCC_APB2ENR |= NM_APB2_IOPAEN | NM_APB2_USART1EN;
     NM_GPIOA_CRH = (NM_GPIOA_CRH & ~0x00000FF0u) | 0x000004B0u;   /* PA9 = 0xB、PA10 = 0x4 */
     NM_USART1_BRR = NM_UART_BRR;
     NM_USART1_CR1 = 0x200Cu;                                      /* UE | TE | RE */
+#elif NM_UART_PORT == 2
+    NM_RCC_APB2ENR |= NM_APB2_IOPAEN;
+    NM_RCC_APB1ENR |= NM_APB1_USART2EN;
+    NM_GPIOA_CRL = (NM_GPIOA_CRL & ~0x0000FF00u) | 0x00004B00u;   /* PA2 = 0xB、PA3 = 0x4 */
+    NM_USART2_BRR = NM_UART_BRR;
+    NM_USART2_CR1 = 0x200Cu;                                      /* UE | TE | RE */
+#else
+    NM_RCC_APB2ENR |= NM_APB2_IOPBEN;
+    NM_RCC_APB1ENR |= NM_APB1_USART3EN;
+    NM_GPIOB_CRH = (NM_GPIOB_CRH & ~0x0000FF00u) | 0x00004B00u;   /* PB10 = 0xB、PB11 = 0x4 */
+    NM_USART3_BRR = NM_UART_BRR;
+    NM_USART3_CR1 = 0x200Cu;                                      /* UE | TE | RE */
+#endif
 }
 
 /* 输入：一个字节；输出：无。预期行为：等发送寄存器空再写，阻塞式。 */
 static void nm_uart_putc(uint8_t c)
 {
-    while (!(NM_USART1_SR & 0x80u)) { }   /* 等 TXE */
-    NM_USART1_DR = c;
+    while (!(NM_UART_SR & 0x80u)) { }   /* 等 TXE */
+    NM_UART_DR = c;
 }
 
 /* 输入：无；输出：收到的字节。预期行为：阻塞等到收到为止。 */
 static uint8_t nm_uart_getc(void)
 {
-    while (!(NM_USART1_SR & 0x20u)) { }   /* 等 RXNE */
-    return (uint8_t)NM_USART1_DR;
+    while (!(NM_UART_SR & 0x20u)) { }   /* 等 RXNE */
+    return (uint8_t)NM_UART_DR;
 }
 
 /* 输入：毫秒数；输出：无。预期行为：72 MHz 下约 7200 次空转算 1 ms，只用于上电等屏、不要求精确。 */

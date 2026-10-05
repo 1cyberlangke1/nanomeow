@@ -18,7 +18,7 @@
 | `c/generated/nm_font.c` | 把 8x8 点阵的汉字/ASCII 子集压成紧凑位流的字库（由 `tools/gen_font.py` 生成） |
 | `c/display/nm_oled.c` | 管理 SSD1306 的 128x64 显存帧缓冲，做 2x 点阵字形缩放绘制，按脏页差分推送 |
 | `c/display/nm_oled_port.c` | 硬件适配层：用 GPIO 模拟软件 I2C 的驱动 |
-| `c/platform/nm_board.h` | 默认硬件引脚映射（默认 PB6=SCL、PB7=SDA；可用工程宏重定向覆盖） |
+| `c/platform/nm_board.h` | 默认硬件映射（默认串口 USART1、PB6=SCL、PB7=SDA；可用工程宏重定向覆盖） |
 | `c/platform/nm_stm32f103.h` | 裸机寄存器地址定义和最简外设头文件 |
 | `c/host/nm_chat.c` | 主机端 CLI 交互入口（可以从 stdin 传 prompt 进来测试） |
 | `c/host/nm_bench.c` | 主机端前向推理的性能基准测试入口 |
@@ -85,13 +85,13 @@ gcc -std=c99 -O2 -Wall -Wextra -Werror -I infer/c -I infer/c/engine -I infer/c/g
 | `nm_font.o` | 380 B | 5,246 B | 0 B | 730 字点阵位流与索引 |
 | `nm_oled.o` | 1,176 B | 25 B | 1,036 B | 显存缓冲与排版管理 |
 | `nm_oled_port.o`| 286 B | 0 B | 0 B | 软件 I2C 总线模拟 |
-| `main.o` | 698 B | 43 B | 3,904 B | 系统初始化与串口回显 |
+| `main.o` | 706 B | 43 B | 3,904 B | 系统初始化与串口回显 |
 
 ### 整机合计
 
 | 物理存储类型 | 实测占用 | 硬件规格上限 | 剩余空间 | 占用率 |
 | :--- | :--- | :--- | :--- | :--- |
-| **Flash (ROM)** | **65,187 B (63.66 KiB)** | 65,536 B (64 KiB) | **349 B** | 99.47% |
+| **Flash (ROM)** | **65,195 B (63.67 KiB)** | 65,536 B (64 KiB) | **341 B** | 99.48% |
 | **SRAM (RAM)** | **18,532 B (18.10 KiB)** | 20,480 B (20 KiB) | **1,948 B** | 90.49% |
 
 ### 核心空间优化策略

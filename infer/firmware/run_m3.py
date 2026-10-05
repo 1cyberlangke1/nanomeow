@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """在 Cortex-M3 模拟器（Unicorn）上**真正执行上板固件**，给「编译通过」补上「跑起来」的证据。
 
-输入：`build_firmware.py` 产出的 ELF（真交叉编译 + 真链接的那个镜像），以及要喂给 USART1 的一行字节。
-输出：固件从 USART1 吐回来的字节（stdout），可选 `--count` 给出精确执行的指令条数。
+输入：`build_firmware.py` 产出的 ELF（真交叉编译 + 真链接的那个镜像），以及要喂给串口的一行字节。
+输出：固件从串口吐回来的字节（stdout），可选 `--count` 给出精确执行的指令条数。
 预期行为：按 ELF 的 PT_LOAD 段把镜像铺进 Flash/RAM，从复位向量取 SP/PC 起跑；板级外设只打两个桩 ——
-          RCC 的 ready 位（HSERDY/PLLRDY/SWS）和 USART1 的 SR/DR，其余内存照实读写。
+          RCC 的 ready 位（HSERDY/PLLRDY/SWS）和 USART1~3 的 SR/DR（三路都桩，固件用哪路由
+          工程 `User/config.h` 的 NM_UART_PORT 决定，换口不用改本文件），其余内存照实读写。
           跑的是**真机指令**，不是行为模型；指令条数是精确计数，不是估算。
           需要 `pip install unicorn`（纯 Python 包，只进本项目 .venv，不碰系统）。
 
-停机判据：固件生成完会回到 `nm_uart_getc` 的阻塞轮询（RXNE 恒 0），此时它对 USART1_SR 会连续空读
+停机判据：固件生成完会回到 `nm_uart_getc` 的阻塞轮询（RXNE 恒 0），此时它对串口的 SR 会连续空读
           成千上万次 —— 数这个连续空读次数，超过阈值就认定这一轮结束，比「猜一个静默窗口」可靠。
 
 用法：
@@ -30,8 +31,11 @@ RAM_BASE, RAM_SIZE = 0x20000000, 20 * 1024
 APB_BASE, APB_SIZE = 0x40000000, 0x30000      # APB1 + APB2 外设窗口
 SCS_BASE, SCS_SIZE = 0xE0000000, 0x10000      # 内核私有区（本固件不开中断，但保留映射）
 
+# 三路 USART 的基址：USART1 挂 APB2（0x40013800），USART2 / USART3 挂 APB1。
+UART_BASES = (0x40013800, 0x40004400, 0x40004800)
 RCC_CR, RCC_CFGR = 0x40021000, 0x40021004
-USART1_SR, USART1_DR = 0x40013800, 0x40013804
+UART_SR = frozenset(UART_BASES)                       # SR = 基址 + 0
+UART_DR = frozenset(base + 4 for base in UART_BASES)  # DR = 基址 + 4
 
 DWT_CYCCNT = 0xE0001004   # 内核私有区里的 32 位周期计数器（固件用它量 tps）
 
@@ -78,7 +82,7 @@ def load_elf(path):
 
 def run_firmware(elf_path, uart_in, max_steps=MAX_STEPS, count=False, idle_sr=IDLE_SR, gpio=None,
                  dwt=False, dwt_chunk=DWT_CHUNK):
-    """输入：ELF 路径、要喂给 USART1 的字节、指令上限、是否精确计数、空读阈值、GPIOB 钩子、DWT 桩。
+    """输入：ELF 路径、要喂给串口的字节、指令上限、是否精确计数、空读阈值、GPIOB 钩子、DWT 桩。
     输出：(固件吐出的字节, 已执行指令条数或 None)。
 
     预期行为：从复位向量起跑，跑到固件阻塞等输入为止；跑到一半崩了就报错，不吞。
@@ -125,7 +129,7 @@ def run_firmware(elf_path, uart_in, max_steps=MAX_STEPS, count=False, idle_sr=ID
         """
         if addr in rcc:
             rcc[addr] = value & 0xFFFFFFFF
-        elif addr == USART1_DR:
+        elif addr in UART_DR:
             out.append(value & 0xFF)
             idle[0] = 0                       # 又吐了一个字节 ⇒ 还在生成，空读计数清零
         elif gpio is not None and GPIOB_BASE <= addr < GPIOB_END:
@@ -145,14 +149,14 @@ def run_firmware(elf_path, uart_in, max_steps=MAX_STEPS, count=False, idle_sr=ID
             if (v & 0x3) == 0x2:
                 v = (v & ~0xC) | 0x8
             uc.mem_write(addr, struct.pack("<I", v))
-        elif addr == USART1_SR:
+        elif addr in UART_SR:
             uc.mem_write(addr, struct.pack("<I",
                                            SR_TXE | SR_TC | (SR_RXNE if pending else 0)))
             if not pending:
                 idle[0] += 1
                 if out and idle[0] > idle_sr:
                     raise _Idle()
-        elif addr == USART1_DR:
+        elif addr in UART_DR:
             uc.mem_write(addr, struct.pack("<I", pending.pop(0) if pending else 0))
         elif addr == GPIOB_IDR and gpio is not None:
             uc.mem_write(addr, struct.pack("<I", gpio.read_idr() & 0xFFFFFFFF))
@@ -182,9 +186,10 @@ def run_firmware(elf_path, uart_in, max_steps=MAX_STEPS, count=False, idle_sr=ID
 
     # 钩子必须限定地址范围：不限定的话每次访存都要回 Python 一次，实测慢一个数量级。
     mu.hook_add(UC_HOOK_MEM_WRITE, on_write, begin=RCC_CR, end=RCC_CFGR + 4)
-    mu.hook_add(UC_HOOK_MEM_WRITE, on_write, begin=USART1_DR, end=USART1_DR + 4)
     mu.hook_add(UC_HOOK_MEM_READ, on_read, begin=RCC_CR, end=RCC_CFGR + 4)
-    mu.hook_add(UC_HOOK_MEM_READ, on_read, begin=USART1_SR, end=USART1_DR + 4)
+    for base in UART_BASES:
+        mu.hook_add(UC_HOOK_MEM_WRITE, on_write, begin=base + 4, end=base + 8)
+        mu.hook_add(UC_HOOK_MEM_READ, on_read, begin=base, end=base + 8)
     if dwt:
         mu.hook_add(UC_HOOK_MEM_READ, on_read, begin=DWT_CYCCNT, end=DWT_CYCCNT + 4)
     if gpio is not None:
@@ -232,7 +237,7 @@ def main():
     """输入：命令行；输出：固件吐出的字节。预期行为：ELF 不存在就报错提示先构建。"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--elf", default=str(ROOT / "build" / "firmware" / "nanomeow.elf"))
-    ap.add_argument("--text", default="你好", help="喂给 USART1 的一行内容（会自动补换行）")
+    ap.add_argument("--text", default="你好", help="喂给串口的一行内容（会自动补换行）")
     ap.add_argument("--build", action="store_true", help="先跑 build_firmware.py 再模拟")
     ap.add_argument("--count", action="store_true", help="精确统计执行的指令条数（慢）")
     args = ap.parse_args()
